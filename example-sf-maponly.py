@@ -131,8 +131,6 @@ collectfn = sum_values
 # Therefore, any supplied Server.finishfn() must be able to handle
 # either a scalar value (indicating that Reduce has completed), or
 # sequence values (indicating that the Reduce phase was skipped.)
-# 
-#reducefn = sum_values
 
 # Skip the Reduce phase; use the Reduce function as Server.finishfn
 reducefn = None
