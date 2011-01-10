@@ -38,6 +38,7 @@ import sys
 import types
 import repr
 import new
+import time
 
 VERSION = 0.0
 
@@ -75,6 +76,14 @@ def applyover( function, iterator ):
         
 
 class Protocol(asynchat.async_chat):
+    """
+    Implements the basic protocol used by mincement Client instances
+    (back to one server), and ServerChannel instances (spawned by
+    Server for each Client connection).  Implements basic
+    challenge/response security, and knows how to freeze-dry and
+    reconstitute basic functions and simple lexical closures (only
+    closures which do not call external functions).
+    """
     def __init__(self, conn=None):
         if conn:
             asynchat.async_chat.__init__(self, conn)
@@ -143,8 +152,16 @@ class Protocol(asynchat.async_chat):
         else:
             self.handle_close()
 
+    def respond_to_ping(self, command, data):
+        self.send_command(':'.join(['pong', 'Reply from %s' % os.gethostname()]))
+
+    def pong(self, command, data):
+        logging.info( command )
+
     def process_command(self, command, data=None):
         commands = {
+            'ping': self.respond_to_ping,
+            'pong': self.pong,
             'challenge': self.respond_to_challenge,
             'disconnect': lambda x, y: self.handle_close(),
             }
@@ -167,9 +184,13 @@ class Protocol(asynchat.async_chat):
         else:
             logging.critical("Unknown unauthed command received: %s" % (command,)) 
             self.handle_close()
-
         
     def store_func(self, fun):
+        """
+        Package up simple, self-contained functions (or functions that
+        call modules/methods that exist in both Server and Client
+        environments).
+        """
         code_blob = marshal.dumps( fun.func_code )
         name = fun.func_name
         dflt = fun.func_defaults
@@ -180,6 +201,13 @@ class Protocol(asynchat.async_chat):
                              pickle.HIGHEST_PROTOCOL )
         
     def load_func(self, blob, globs):
+        """
+        Load a pickled function.  Attempts to also handle some simple
+        closures. See:
+        
+            http://stackoverflow.com/questions/573569/python-serialize-lexical-closures
+
+        """
         code_blob, name, dflt, clos_tupl = pickle.loads( blob )
         code = marshal.loads( code_blob )
         clos = None
@@ -202,17 +230,21 @@ class Protocol(asynchat.async_chat):
 
 class Client(Protocol):
     """
+    Connect's to a specified server:port, and processes commands
+    (authentication is handled by the Protocl superclass).
     """
     def __init__(self):
         Protocol.__init__(self)
         self.mapfn = self.reducefn = self.collectfn = None
         
     def conn(self, server, port):
+        logging.info( "Connecting to server at %s:%s" % ( server, port ))
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connect((server, port))
         asyncore.loop()
 
     def handle_connect(self):
+        logging.info( "Server connected." )
         pass
 
     def handle_close(self):
@@ -308,6 +340,9 @@ class Server(asyncore.dispatcher, object):
     If the Reduce phase is trivial, it may be preferable to simply use
     the defined Server.reducefn as the .finishfn, leaving .reducefn as
     None.
+    
+    Creates instances of ServerChannel on-demand, as incoming connect
+    requests complete.
     """
     def __init__(self):
         asyncore.dispatcher.__init__(self)
@@ -349,11 +384,39 @@ class Server(asyncore.dispatcher, object):
         return results
 
     def handle_accept(self):
-        conn, addr = self.accept()
-        sc = ServerChannel(conn, self)
+        """
+        Accept a new client connection, spawing a channel to handle
+        it.  This initiates the authentication procedure, and should
+        (eventually) result in the channel asking for tasks from this
+        server's taskmanager.  We'll let TaskManager collect and
+        manage the pool of available channels.  Ensure we handle
+        accept() error cases (see http://bugs.python.org/issue6706)
+        """
+        try:
+            sock, addr = self.accept()
+        except TypeError:
+            # sometimes accept() might return None (see issue 91)
+            return
+        except socket.error, err:
+            # ECONNABORTED might be thrown on *BSD (see issue 105)
+            if err[0] != errno.ECONNABORTED:
+                logging.error( traceback.format_exc() )
+            return
+        else:
+            # sometimes addr == None instead of (ip, port) (see issue 104)
+            if addr == None:
+                return
+
+        logging.debug( "Client connected: %s, %s" % ( repr.repr( sock ), repr.repr( addr )))
+        sc = ServerChannel( sock, addr, self )
         sc.password = self.password
 
     def handle_close(self):
+        """
+        Close the Server's port.  This will prevent new clients from
+        connecting, but won't close all the individual client
+        connections serviced by all the ServerChannels.
+        """
         self.close()
 
     def set_datasource(self, ds):
@@ -367,14 +430,34 @@ class Server(asyncore.dispatcher, object):
 
 
 class ServerChannel(Protocol):
-    def __init__(self, conn, server):
-        Protocol.__init__(self, conn)
-        self.server = server
+    """
+    ServerChannel -- Handles Server connection to each Client
 
+    Each channel authenticates the client, and proceeds to obtain
+    tasks from its server's TaskManager and send them to the client.
+    When (and if) the task completes, its results are reported back to
+    the server's TaskManager, and another task requested.
+
+    The default behaviour for using a client is to:
+    A) authenticate
+    B) Start a task, by
+    C)   getting it from the TaskManager (going idle if None)
+    D)   sending it to the client
+    E) When a 'mapdone' or 'reducedone' is received, go to B
+    F) If EOF encountered, close session
+
+    If a channel goes idle, invoke channel.start_new_task() to start
+    it up, by force it to go get a new task.
+    """
+    def __init__(self, sock, addr, server):
+        Protocol.__init__(self, sock)
+        self.peer = addr
+        self.server = server
         self.start_auth()
 
     def handle_close(self):
         logging.info("Client disconnected")
+        self.server.taskmanager.channels.pop( self.peer, None )
         self.close()
 
     def start_auth(self):
@@ -394,16 +477,32 @@ class ServerChannel(Protocol):
         self.server.taskmanager.reduce_done(data)
         self.start_new_task()
 
+    def send_command(self, command, data = None):
+        self.server.taskmanager.channels[self.peer] = ( command, time.time() )
+        Protocol.send_command(self, command, data)
+
     def process_command(self, command, data=None):
         commands = {
             'mapdone': self.map_done,
             'reducedone': self.reduce_done,
             }
 
+        try:
+            pair = self.server.taskmanager.channels[self.peer]
+            if pair is None:
+                logging.debug( 'Processing %-12s (no command sent!)' % ( command ))
+            else:
+                last, when = pair
+                logging.debug( 'Processing %-12s (%6.3fs since %s)' % ( command, time.time() - when, last ))
+        except KeyError:
+            logging.debug( 'Processing %16s (channel not known!)' % ( command ))
+        self.server.taskmanager.channels[self.peer] = None
+        
         if command in commands:
             commands[command](command, data)
         else:
             Protocol.process_command(self, command, data)
+
 
     def post_auth_init(self):
         if self.server.mapfn:
@@ -415,22 +514,64 @@ class ServerChannel(Protocol):
         self.start_new_task()
     
 class TaskManager:
-    START = 0
-    MAPPING = 1
-    REDUCING = 2
-    FINISHED = 3
+    """
+    Produce a stream of Map/Reduce tasks for all requesting
+    ServerChannel channels. 
 
-    MAPREDUCE = None
-    MAPONLY = 1 
-    REDUCEONLY = 2
+    Normally, the default TaskManager .tasks is MAPREDUCE, and
+    .allocation to CONTINUOUS, meaning that each channel will receive
+    a continous stream of all available 'map' tasks, followed by all
+    available 'reduce' tasks.
+    
+    After all available 'map' tasks have been assigned to a client,
+    any 'map' tasks not yet reported as complete will be
+    (duplicately!) re-assigned to the next Client who asks.  This
+    takes care of stalled or failed clients.
 
-    def __init__(self, datasource, server, tasks = None ):
+    When all 'map' tasks have been reported as completed (any
+    duplicate responses are ignored), then the 'reduce' tasks are
+    assigned to the following next_task clients.
+
+    Finally, once all Map/Reduce tasks are completed, the clients are
+    given the 'disconnect' task.
+
+    """
+    # Possible .state
+    START	= 0
+    MAPPING	= 1
+    REDUCING	= 2
+    FINISHED	= 3
+
+    # Possible .tasks option
+    MAPREDUCE	= 0
+    MAPONLY	= 1		# Only perform the Map phase
+    REDUCEONLY	= 2		# Only perform the Reduce phase
+
+    # Possible .allocation option
+    CONTINUOUS	= 0		# Continuously allocate tasks to every channel
+    ONESHOT	= 1		# Only allocate a single Map/Reduce task to each
+
+    # Possible .cycles options
+    SINGLEUSE   = 0		# After finishing, close Server and 'disconnect' clients
+    PERMANENT   = 1		# Go idle 'til another Map/Reduce starts
+
+    def __init__(self, datasource, server,
+                 tasks = None, allocation = None, cycle = None ):
         self.datasource = datasource
         self.server = server
         self.state = TaskManager.START
-        self.tasks = tasks
+        self.tasks = tasks or TaskManager.MAPREDUCE
+        self.allocation = allocation or TaskManager.CONTINUOUS
+        self.cycle = cycle or TaskManager.SINGLEUSE
+
+        # Track what channels were last reported as being up to
+        # { peer: (command, timetamp), ... }
+        self.channels = {}
 
     def next_task(self, channel):
+
+        for a,c in self.channels.items():
+            logging.debug( "%20s: %s" % ( a, c ))
         if self.state == TaskManager.START:
             self.map_iter = iter(self.datasource)
             self.working_maps = {}
@@ -449,6 +590,7 @@ class TaskManager:
                 map_key = self.map_iter.next()
                 map_item = map_key, self.datasource[map_key]
                 self.working_maps[map_item[0]] = map_item[1]
+
                 return ('map', map_item)
             except StopIteration:
                 if len(self.working_maps) > 0:
@@ -478,6 +620,9 @@ class TaskManager:
                 self.state = TaskManager.FINISHED
 
         if self.state == TaskManager.FINISHED:
+            # Stop accepting new Client connections, and send a
+            # 'disconnect' to each client that asks for a new task.
+            # 
             self.server.handle_close()
             return ('disconnect', None)
     

@@ -5,6 +5,8 @@ import logging
 import repr
 
 '''
+example-sf-maponly	-- skips reduce phase (run finish func. in server)
+
     To run this test, first start the example Map-Reduce server; this
 will bind to the default port, on all interface:
     
