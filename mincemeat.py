@@ -36,13 +36,43 @@ import random
 import socket
 import sys
 import types
+import repr
+import new
 
 VERSION = 0.0
 
 
 DEFAULT_PORT = 11235
 
+    
+def generator( function ):
+    """
+    Decorator takes a simple function with signature "function( key, [
+    value, ...] ) ==> value", and turns it into an iterator driven
+    generator function suitable for use as a Server.collectfn or
+    Server.finishfn (yields (k,v) tuples.)
+    """
+    def decorator( kvi ):
+        for k, v in kvi:
+            yield k, function( k, v )
+    return decorator
 
+def applyover( function, iterator ):
+    """
+    Takes a function, which may take either an iterator argument or a
+    simple key/value(s) pair, and returns a generator over the given
+    dictionary item iterator.
+    
+    This allows the user to supply the older style simple functions,
+    or newer style generators that have access to the whole result
+    dictionary for the .collectfn after Map, or the .finishfn after
+    Reduce.
+    """
+    try:
+        return function( iterator )
+    except TypeError:
+        return generator( function )( iterator )
+        
 
 class Protocol(asynchat.async_chat):
     def __init__(self, conn=None):
@@ -65,7 +95,7 @@ class Protocol(asynchat.async_chat):
         if data:
             pdata = pickle.dumps(data)
             command += str(len(pdata))
-            logging.debug( "<- %s" % command)
+            logging.debug( "<- %s( %s )" % ( command, repr.repr( data )))
             self.push(command + "\n" + pdata)
         else:
             logging.debug( "<- %s" % command)
@@ -137,9 +167,42 @@ class Protocol(asynchat.async_chat):
         else:
             logging.critical("Unknown unauthed command received: %s" % (command,)) 
             self.handle_close()
+
+        
+    def store_func(self, fun):
+        code_blob = marshal.dumps( fun.func_code )
+        name = fun.func_name
+        dflt = fun.func_defaults
+        clos_tupl = None
+        if fun.func_closure:
+            clos_tupl = tuple( c.cell_contents for c in fun.func_closure )
+        return pickle.dumps( ( code_blob, name, dflt, clos_tupl ),
+                             pickle.HIGHEST_PROTOCOL )
+        
+    def load_func(self, blob, globs):
+        code_blob, name, dflt, clos_tupl = pickle.loads( blob )
+        code = marshal.loads( code_blob )
+        clos = None
+        if clos_tupl:
+            ncells = range( len( clos_tupl ))
+            src = '\n'.join(
+                [ "def _f(arg):" ] +
+                [ "  _%d = arg[%d] "     % ( n, n ) for n in ncells ] +
+                [ "  return lambda:(%s)" % ','.join( "_%d" %n for n in ncells ) ] +
+                [ "" ]
+              )
+            try:
+                exec src
+            except:
+                raise SyntaxError( src )
+            clos = _f( clos_tupl ).func_closure
+
+        return new.function( code, globs, name, dflt, clos )
         
 
 class Client(Protocol):
+    """
+    """
     def __init__(self):
         Protocol.__init__(self)
         self.mapfn = self.reducefn = self.collectfn = None
@@ -156,24 +219,46 @@ class Client(Protocol):
         self.close()
 
     def set_mapfn(self, command, mapfn):
-        self.mapfn = types.FunctionType(marshal.loads(mapfn), globals(), 'mapfn')
+        self.mapfn = self.load_func( mapfn, globals() )
 
     def set_collectfn(self, command, collectfn):
-        self.collectfn = types.FunctionType(marshal.loads(collectfn), globals(), 'collectfn')
+        self.collectfn = self.load_func( collectfn, globals() )
 
     def set_reducefn(self, command, reducefn):
-        self.reducefn = types.FunctionType(marshal.loads(reducefn), globals(), 'reducefn')
+        self.reducefn = self.load_func( reducefn, globals() )
 
     def call_mapfn(self, command, data):
+        """
+        In the Map phase, the result is always:
+        
+            {
+              key: [ value, value, ... ],
+              key: [ value, value, ... ]
+              ...
+            }
+
+        Therefore, since result of the .collectfn is a simple value,
+        it must be wrapped to produce a ( key, [ value ] ) tuple, as
+        would be produced by the normal Map phase.
+        """
         logging.info("Mapping %s" % str(data[0]))
         results = {}
         for k, v in self.mapfn(data[0], data[1]):
             if k not in results:
                 results[k] = []
             results[k].append(v)
+
         if self.collectfn:
-            for k in results:
-                results[k] = [self.collectfn(k, results[k])]
+            # Applies the specified .collectfn, either as an interator based
+            # generator, or as a simple function over key/values
+            rgen = applyover( self.collectfn, results.iteritems() )
+
+            # Use the generator expression, and create a new results
+            # dict.  We don't simply update the results in place,
+            # because the collectfn may choose to alter the keys
+            # (eg. discarding invalid keys, adding new keys).
+            results = dict( ( k, [ v ] ) for k, v in rgen )
+
         self.send_command('mapdone', (data[0], results))
 
     def call_reducefn(self, command, data):
@@ -201,6 +286,29 @@ class Client(Protocol):
 
 
 class Server(asyncore.dispatcher, object):
+    """
+    Server -- Distributes Map-Reduce tasks to authenticated clients.
+    
+    The Map phase allocates a source key/value pair to a client, which
+    applies the given Server.mapfn/.collectfn, and returns the
+    resultant keys, each with their list of values.  Next, each of the
+    Map key/values lists are allocated to a Reduce client, which
+    applies the supplied .reducefn.  Finally, the server applies any
+    given .finishfn.
+    
+    If exactly ONE of Server.mapfn or .reducefn is not supplied, the
+    Map or Reduce phase is skipped.
+    
+    The Server.collectfn and .finishfn are optional, and may take
+    either a key/value pair and return a new value, or take an
+    iterable over key/value pairs, and return key/value pairs.  They
+    may be used to post-process Map values (in the Client), or
+    post-process Map/Reduce values (in the Server).  
+
+    If the Reduce phase is trivial, it may be preferable to simply use
+    the defined Server.reducefn as the .finishfn, leaving .reducefn as
+    None.
+    """
     def __init__(self):
         asyncore.dispatcher.__init__(self)
         self.mapfn = None
@@ -214,13 +322,31 @@ class Server(asyncore.dispatcher, object):
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.bind(("", port))
         self.listen(1)
+
+        # If either the Map or Reduce functions are empty, direct the
+        # TaskManager to skip that phase.  Since Server.reducefn and
+        # .mapfn are not set at Server.__init__ time, we must defer
+        # 'til run_server is invoked, to detect if these are provided.
+        if self.reducefn is None:
+            self.taskmanager.tasks = TaskManager.MAPONLY
+        elif self.mapfn is None:
+            self.taskmanager.tasks = TaskManager.REDUCEONLY
+
         try:
             asyncore.loop()
         except:
             self.close_all()
             raise
-        
-        return self.taskmanager.results
+
+        # Successfully completed Map/Reduce.  If .finishfn supplied,
+        # support either .finishfn(iterator), or .finishfn(key,value)
+        results = self.taskmanager.results
+        if self.finishfn:
+            # Create a finished result dictionary by applying the
+            # supplied Server.finishfn over the Reduce results.
+            rgen = applyover( self.finishfn, results.iteritems() )
+            results = dict( ( k, v ) for k, v in rgen )
+        return results
 
     def handle_accept(self):
         conn, addr = self.accept()
@@ -281,11 +407,11 @@ class ServerChannel(Protocol):
 
     def post_auth_init(self):
         if self.server.mapfn:
-            self.send_command('mapfn', marshal.dumps(self.server.mapfn.func_code))
+            self.send_command('mapfn', self.store_func( self.server.mapfn ))
         if self.server.reducefn:
-            self.send_command('reducefn', marshal.dumps(self.server.reducefn.func_code))
+            self.send_command('reducefn', self.store_func( self.server.reducefn ))
         if self.server.collectfn:
-            self.send_command('collectfn', marshal.dumps(self.server.collectfn.func_code))
+            self.send_command('collectfn', self.store_func( self.server.collectfn ))
         self.start_new_task()
     
 class TaskManager:
@@ -294,18 +420,30 @@ class TaskManager:
     REDUCING = 2
     FINISHED = 3
 
-    def __init__(self, datasource, server):
+    MAPREDUCE = None
+    MAPONLY = 1 
+    REDUCEONLY = 2
+
+    def __init__(self, datasource, server, tasks = None ):
         self.datasource = datasource
         self.server = server
         self.state = TaskManager.START
+        self.tasks = tasks
 
     def next_task(self, channel):
         if self.state == TaskManager.START:
             self.map_iter = iter(self.datasource)
             self.working_maps = {}
             self.map_results = {}
-            #self.waiting_for_maps = []
             self.state = TaskManager.MAPPING
+            if self.tasks is TaskManager.REDUCEONLY:
+                # If Reduce only, skip the Map phase, passing source
+                # key/value pairs straight to the Reduce phase.
+                self.reduce_iter = self.map_iter
+                self.working_reduces = {}
+                self.result = {}
+                self.stats = TaskManager.REDUCING
+
         if self.state == TaskManager.MAPPING:
             try:
                 map_key = self.map_iter.next()
@@ -316,10 +454,17 @@ class TaskManager:
                 if len(self.working_maps) > 0:
                     key = random.choice(self.working_maps.keys())
                     return ('map', (key, self.working_maps[key]))
+                # No more entries left to Map; begin Reduce (or skip)
                 self.state = TaskManager.REDUCING
                 self.reduce_iter = self.map_results.iteritems()
                 self.working_reduces = {}
                 self.results = {}
+                if self.tasks is TaskManager.MAPONLY:
+                    # Skip Reduce phase, passing the key/value pairs
+                    # output by Map straight to the result.
+                    self.results = self.map_results
+                    self.state = TaskManager.FINISHED
+
         if self.state == TaskManager.REDUCING:
             try:
                 reduce_item = self.reduce_iter.next()
@@ -329,7 +474,9 @@ class TaskManager:
                 if len(self.working_reduces) > 0:
                     key = random.choice(self.working_reduces.keys())
                     return ('reduce', (key, self.working_reduces[key]))
+                # No more entries left to Reduce; finish
                 self.state = TaskManager.FINISHED
+
         if self.state == TaskManager.FINISHED:
             self.server.handle_close()
             return ('disconnect', None)
@@ -338,7 +485,7 @@ class TaskManager:
         # Don't use the results if they've already been counted
         if not data[0] in self.working_maps:
             return
-
+        logging.debug( "Map Done: %s ==> %s" % ( data[0], repr.repr( data[1] )))
         for (key, values) in data[1].iteritems():
             if key not in self.map_results:
                 self.map_results[key] = []
@@ -349,7 +496,7 @@ class TaskManager:
         # Don't use the results if they've already been counted
         if not data[0] in self.working_reduces:
             return
-
+        logging.debug( "Reduce Done: %sfg ==> %s" % ( data[0], repr.repr( data[1] )))
         self.results[data[0]] = data[1]
         del self.working_reduces[data[0]]
 
@@ -369,7 +516,7 @@ def run_client():
 
     client = Client()
     client.password = options.password
-    client.conn(args[0], options.port)
+    client.conn( len(args) > 0 and args[0] or "localhost", options.port)
                       
 
 if __name__ == '__main__':
