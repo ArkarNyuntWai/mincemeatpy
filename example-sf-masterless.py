@@ -377,7 +377,7 @@ def main_server_on_demand():
     # done, and should have finished() and produced results().
     if svr:
         svrthr.join(1)
-        if svrthr.is_alive():
+        if svrthr.isAlive():
             logging.error("Server thread didn't exit cleanly")
         if not svr.finished():
             logging.error("Server never finished; produced no results")

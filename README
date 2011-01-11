@@ -3,9 +3,75 @@ mincemeat.py: MapReduce on Python
 mincemeat.py is licensed under the MIT license. See LICENSE for more details
 
 
-Run the example with:
-python example.py
+REQUIREMENTS
+
+Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/haslib/sha1
+
+
+EXAMPLES
+
+Run the basic example with:
+
+    python example.py
 
 and a worker with:
-python mincemeat.py -p changeme [server address]
 
+    python mincemeat.py -p changeme [server address (default "localhost")]
+
+
+The example-sf-... examples require the Gutenberg SF CD, or some other
+set of big *.txt files, in:
+
+     ../Gutenberg SF CD/Gutenberg SF/*.txt
+
+Download the Gutenberg SF CD using Bit Torrent, from:
+
+    http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
+
+Unzip the ISO, mount it, and copy (or symbolic link, on Posix
+platforms) it in the directory above where you've cloned the
+mincemeatpy repository; name it "Gutenberg SF CD".
+
+
+* Skipping the Reduce Phase
+
+The first Big Corpus example illustrates replacing a trivial Reduce
+phase with a "finish" function executed in the server node.  Start a
+server (binds to all available interfaces):
+
+   python example-sf-maponly.py
+
+and worker(s) with:
+
+    python mincemeat.py -p changeme [server address (default "localhost")
+
+
+* Dynamically Electing a Server
+
+The next examples illustrate various means of dynamically spawning a
+server, if necessary.  They all bind to "localhost" by default (change
+addr_info in the text to specify another server host interface name).
+Each instance run elects itself to be the server, if necessary, or
+becomes a client.  Start multiple instances on the same host:
+
+    python example-sf-election.py
+
+and workers(s) with:
+
+    python example-sf-election.py
+or
+    python mincemeat.py -v -p changeme
+
+
+* Multithreaded Clients/Servers
+
+The example-sf-masterless.py example runs both a client thread and a
+server thread (if necessary), in the same instance, to illustrate how
+one might build a dynamic, robust Map-Reduce grid, when we don't have
+control over the lifespan of the instances (eg. a web server farm,
+...).
+
+    python example-sf-masterless.py
+
+This will run a client and a server!  To speed it up, create more
+clients by running the same command.

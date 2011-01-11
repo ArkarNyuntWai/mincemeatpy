@@ -96,9 +96,21 @@ def loop(map=None):
         # We're no longer running asyncore.loop, so can't do anything
         # cleanly; just close 'em all...  This should ensure that any
         # socket resources associated with this object get cleaned up.
-        logging.error(traceback.format_exc())
-        asyncore.close_all(map=map, ignore_all=True)
-        raise
+        # In order to ensure that the original error context gets
+        # raised, even if the asyncore.close_all fails, we must use
+        # re-raise inside a try-finally.
+        try:
+            raise
+        finally:
+            try:
+                asyncore.close_all(map=map, ignore_all=True)
+            except TypeError:
+                # Support pre-2.6 asyncore; no ignore_all...
+                try: 
+                    asyncore.close_all(map=map)
+                except Exception, e:
+                    logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
+
 
 class Protocol(asynchat.async_chat):
     """
@@ -116,14 +128,42 @@ class Protocol(asynchat.async_chat):
     def __init__(self, sock=None, map=None):
         """
         A Map/Reduce client Protocol instance.  Optionally, provide a
-        'map' dict shared by all asycore based objects to be activated
-        using the same asycore.loop.
+        socket map shared by all asyncore based objects to be activated
+        using the same asyncore.loop.
         """
-        asynchat.async_chat.__init__(self, sock=sock, map=map)
+        # Preserve pre-2.6 compatibility by avoiding map, iff None.
+        # Also first keyword name changed, so pass as simple arg...
+        if map is None:
+            asynchat.async_chat.__init__(self, sock)
+        else:
+            # However, if we must specify a custom map...
+            try:
+                asynchat.async_chat.__init__(self, sock, map=map)
+            except TypeError, e:
+                # ... before 2.6, async_chat wasn't updated to pass a
+                # custom socket map thru to asyncore.dispatcher...
+                # So, we have to intercept the global socket_map,
+                # __init__ it, and fix it up after.
+                logging.debug( "Pre-2.6 asynchat; intercepting socket map: %s" % e )
+                try:
+                    save_asm = asyncore.socket_map
+                    asyncore.socket_map = map
+                    Protocol.__init__(self, sock)
+                finally:
+                    asyncore.socket_map = save_asm
+
+
         self.set_terminator("\n")
         self.buffer = []
         self.auth = None
         self.mid_command = False
+
+    def log_info(self, message, type):
+        """
+        The asyncore.dispatcher.log_info type='name' categorization
+        maps directly onto the logging.name; redirect.
+        """
+        getattr(logging,type)(message)
 
     def collect_incoming_data(self, data):
         self.buffer.append(data)
@@ -292,12 +332,15 @@ class Client(Protocol):
         may want to check that .auth is 'Done' after this call, to
         ensure that we successfully connected to and authenticated a
         server...
+        
+        Since the default kernel socket behavior for interface == ""
+        is inconsistent, we'll choose "localhost".
         """
         if password is not None:
             self.password = password
         logging.info("Connecting to server at %s:%s" % (interface, port))
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.connect((interface, port))
+        self.connect((interface or "localhost", port))
 
         if asynchronous is False:
             self.process()
@@ -312,7 +355,7 @@ class Client(Protocol):
         loop(self._map)
 
     def handle_connect(self):
-        logging.info("Server connected.")
+        logging.info("Client initiating connection to Server...")
         pass
 
     def handle_close(self):
@@ -320,7 +363,7 @@ class Client(Protocol):
         EOF received, or other communications channel failure
         (eg. authentication failure).
         """
-        logging.info("Server connection being closed.")
+        logging.info("Client closing connection.")
         self.close()
         self.closed = True
 
@@ -481,7 +524,11 @@ class Server(asyncore.dispatcher, object):
         map.  Every Server, Client (or other asyncore object) which
         uses the same asyncore.loop thread must share the same map.
         """
-        asyncore.dispatcher.__init__(self, map=map)
+        if map is None:
+            # Preserve pre-2.6 compatibility by avoiding map, iff None
+            asyncore.dispatcher.__init__(self)
+        else:
+            asyncore.dispatcher.__init__(self, map=map)
         self.mapfn = None
         self.collectfn = None
         self.reducefn = None
@@ -491,6 +538,9 @@ class Server(asyncore.dispatcher, object):
         self.taskmanager = None
         self.shutdown = False		# Termination indication to clients
 
+    def log_info(self, message, type):
+        getattr(logging,type)(message)
+        
     def run_server(self, password="", port=DEFAULT_PORT, interface='',
                    asynchronous=False):
         """
@@ -545,6 +595,9 @@ class Server(asyncore.dispatcher, object):
         the caller's responsibility to do so; every Client and/or
         Server with a shared map=... require only one loop(obj._map)
         or obj.process() thread.
+
+        The default behaviour of bind when interface == '' is pretty
+        consistently to bind to all available interfaces.
         """
         self.password = password
         logging.debug("Server port opening.")
@@ -701,6 +754,7 @@ class ServerChannel(Protocol):
     it up, by force it to go get a new task.
     """
     def __init__(self, sock, addr, server):
+        # We need to use the same asyncore _map as the server.
         Protocol.__init__(self, sock = sock, map = server._map)
         self.peer = addr
         self.server = server
@@ -816,7 +870,7 @@ class TaskManager:
 
     # Possible .cycles options
     SINGLEUSE   = 0		# After finishing, close Server and 'disconnect' clients
-    PERMANENT   = 1		# Go idle 'til another Map/Reduce starts
+    PERMANENT   = 1		# Go idle 'til another Map/Reduce transaction starts
 
     def __init__(self, datasource, server,
                  tasks=None, allocation=None, cycle=None):
@@ -900,13 +954,15 @@ class TaskManager:
                 self.working_reduces = {}
                 self.result = {}
                 self.stats = TaskManager.REDUCING
+                logging.debug('Server Reducing (skipping Map)')
+            else:
+                logging.debug('Server Mapping')
 
         if self.state == TaskManager.MAPPING:
             try:
                 map_key = self.map_iter.next()
                 map_item = map_key, self.datasource[map_key]
                 self.working_maps[map_item[0]] = map_item[1]
-
                 return ('map', map_item)
             except StopIteration:
                 # A complete iteration of map items is done; either
@@ -929,6 +985,9 @@ class TaskManager:
                     # output by Map straight to the result.
                     self.results = self.map_results
                     self.state = TaskManager.FINISHED
+                    logging.debug('Server Finishing (skipping Reduce)')
+                else:
+                    logging.debug('Server Reducing')
 
         if self.state == TaskManager.REDUCING:
             try:
@@ -939,12 +998,16 @@ class TaskManager:
                 if len(self.working_reduces) > 0:
                     key = random.choice(self.working_reduces.keys())
                     return ('reduce', (key, self.working_reduces[key]))
-                # No more entries left to Reduce; finish
+                # No more entries left to Reduce; finish (self.results now valid)
                 self.state = TaskManager.FINISHED
 
         if self.state == TaskManager.FINISHED:
             # Stop accepting new Client connections, and send a
             # 'disconnect' to each client that asks for a new task.
+            # TODO: For PERMANENT TaskManagers, we do NOT want to
+            # close; in fact, we can remove this (and server
+            # argument), and let the server itself decide when it
+            # should shut down.
             self.server.tidy_close()
             return ('disconnect', None)
     
@@ -983,7 +1046,7 @@ def run_client():
 
     client = Client()
     client.password = options.password
-    client.conn( len(args) > 0 and args[0] or "localhost", options.port)
+    client.conn( len(args) > 0 and args[0] or "", options.port)
                       
 
 if __name__ == '__main__':
