@@ -23,75 +23,6 @@ to create a client.  Therefore, this test will actually create a
 server thread AND a client, and will complete on its own!  You may
 start other instances, to speed things up -- they will connect to the
 existing server, and will act as clients only...
-
-
-
-    In its most simple form, a Map-Reduce cluster has a Server and
-several (perhaps transient) Clients.  The server configures the Client
-appropriately, sends one or more Map and/or Reduce requests to the
-Client, collecting the results.  If the Client fails without returning
-the result, the Server will (eventually) send the same Map/Reduce
-requests to another Client.  When complete, the Server disconnects
-from all Clients and exits.  In all cases, the Server is in control of
-the lifespan of the Clients, and also schedules all of the Map/Reduce
-Tasks, and all constituent Map/Reduce Transactions.
-
-               +-------(C)
-              /
-             v
-            (S)<--------(C)
-             ^
-              \
-               +-----(C)
-
-
-    In other typical uses of Map-Reduce, the Clients might be in
-control.  For example, if you have a web server farm with many clients
-created spontaneously by the web server infrastructure, where any each
-process will be a Map-Reduce Client, and any Client may need to
-schedule some Map/Reduce task to be processed across all other
-Clients.  In this case, a Server needs to be elected from among the
-Clients (if none exists yet); another Server may need to be
-re-elected, should one disappear before (or during) processing of some
-Client's task.  Since the Server binds atomically and unilaterally to
-a port, any Client could spawn a thread to implement a Server when it
-fails to connect to an existing one.  Here is an example of a Client
-connecting to a Server hosted as a thread within the same process:
-
-               +-------(C)
-              /
-             v
-        (C->(S))<--------(C)
-             ^
-              \
-               +-----(C)
-
-    After that server node fails, the Clients connect to a new one;
-the first one to detect the failure attempts to reconnect and then
-fails, and will spawn a Server thread:
-
-                       (C)-+
-                            \
-                             v
-        (XXXXX)         (C->(S))
-                             ^
-                            /
-                     (C)---+
-
-
-
-    Here is the original simple dictionary datasource:
-
-        data = ["Humpty Dumpty sat on a wall",
-                "Humpty Dumpty had a great fall",
-                "All the King's horses and all the King's men",
-                "Couldn't put Humpty together again",
-                ]
-        # The data source can be any dictionary-like object
-        datasource = dict(enumerate(data))
-
-Alternatively, here is a iterable that returns the contents of a set of
-files designated by name (or a "glob" pattern match):
 '''
 
 class file_contents(object):
@@ -325,7 +256,8 @@ def main_server_on_demand():
         for _ in range(10):
             try:
                 # Create a client.  This will block if we successfully
-                # connect, 'til the Server is done the Map-Reduce task...
+                # connect, 'til the Server is done issuing the client
+                # Map-Reduce tasks...
                 cli = client(credentials  = addr_info,
                              asynchronous = False,
                              map          = {})
@@ -336,9 +268,14 @@ def main_server_on_demand():
             except socket.error, e:
                 # No Server (yet).  Start one; if we've already
                 # started a Server thread, just wait a bit longer...
-                # We start this non-asynchronously, meaning that
-                # Server.conn() will not return 'til done processing
-                # (or an exception is thrown).
+                # We start this asynchronously, meaning that
+                # Server.conn() will return immediately (if it can
+                # successfully bind), and we'll start the svr.process
+                # in another thread.  This will continue processing
+                # 'til the Map-Reduce Transaction is complete (or an
+                # exception is thrown).  Both the client and the
+                # server have independent asyncore socket maps, so
+                # their service loops will run in independent threads.
                 logging.debug( "Client connection failed: %s" % e )
                 if not svr:
                     # Create a Server, and (if successful), also a svrthr.

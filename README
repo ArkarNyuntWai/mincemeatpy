@@ -75,3 +75,60 @@ control over the lifespan of the instances (eg. a web server farm,
 
 This will run a client and a server!  To speed it up, create more
 clients by running the same command.
+
+
+TOPOLOGY
+
+    In its most simple form, a Map-Reduce cluster has a Server and
+several (perhaps transient) Clients.  The server configures the Client
+appropriately, sends one or more Map and/or Reduce requests to the
+Client, collecting the results.  If the Client fails without returning
+the result, the Server will (eventually) send the same Map/Reduce
+requests to another Client.  When complete, the Server disconnects
+from all Clients and exits.  In all cases, the Server is in control of
+the lifespan of the Clients, and also schedules all of the Map/Reduce
+Tasks, and all constituent Map/Reduce Transactions.
+
+               +-------(C)
+              /
+             v
+            (S)<--------(C)
+             ^
+              \
+               +-----(C)
+
+
+    In other typical uses of Map-Reduce, the Clients might be in
+control.  For example, if you have a web server farm with many clients
+created spontaneously by the web server infrastructure, where any each
+process will be a Map-Reduce Client, and any Client may need to
+schedule some Map/Reduce task to be processed across all other
+Clients.  In this case, a Server needs to be elected from among the
+Clients (if none exists yet); another Server may need to be
+re-elected, should one disappear before (or during) processing of some
+Client's task.  Since the Server binds atomically and unilaterally to
+a port, any Client could spawn a thread to implement a Server when it
+fails to connect to an existing one.  Here is an example of a Client
+connecting to a Server hosted as a thread within the same process:
+
+               +-------(C)
+              /
+             v
+        (C->(S))<--------(C)
+             ^
+              \
+               +-----(C)
+
+    After that server node fails, the Clients connect to a new one;
+the first one to detect the failure attempts to reconnect and then
+fails, and will spawn a Server thread:
+
+                       (C)-+
+                            \
+                             v
+        (XXXXX)         (C->(S))
+                             ^
+                            /
+                     (C)---+
+
+
