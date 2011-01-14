@@ -33,12 +33,15 @@ import marshal
 import optparse
 import os
 import random
+import select
 import socket
 import sys
 import types
 import repr
 import new
+import threading
 import time
+import timeit
 import traceback
 
 VERSION = 0.0
@@ -46,6 +49,8 @@ VERSION = 0.0
 
 DEFAULT_PORT = 11235
 
+# Choose the best high-resolution timer for the platform
+timer = timeit.default_timer
     
 def generator(func):
     """
@@ -78,7 +83,7 @@ def applyover(func, itr):
     except TypeError:
         return generator(func)(itr)
 
-def loop(map=None):
+def loop(timeout=30.0, use_poll=False, map=None, count=None):
     """
     Processes asyncore based Server or Client events 'til none left.
     On Exception, forcibly cleans up all sockets using the same
@@ -91,7 +96,8 @@ def loop(map=None):
     Server instances listening on different ports.
     """
     try:
-        asyncore.loop(map=map)
+        asyncore.loop(timeout=timeout, use_poll=use_poll,
+                      map=map, count=count)
     except:
         # We're no longer running asyncore.loop, so can't do anything
         # cleanly; just close 'em all...  This should ensure that any
@@ -102,15 +108,22 @@ def loop(map=None):
         try:
             raise
         finally:
-            try:
-                asyncore.close_all(map=map, ignore_all=True)
-            except TypeError:
-                # Support pre-2.6 asyncore; no ignore_all...
-                try: 
-                    asyncore.close_all(map=map)
-                except Exception, e:
-                    logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
+            close_all(map=map, ignore_all=True)
 
+def close_all(map=None, ignore_all=False):
+    """
+    Safely close all sockets, forcing loop (using the same map) to
+    exit.  Handles pre-2.6 asyncore.close_all args.
+    """
+    try:
+        asyncore.close_all(map=map, ignore_all=True)
+    except TypeError:
+        # Support pre-2.6 asyncore; no ignore_all...
+        try: 
+            asyncore.close_all(map=map)
+        except Exception, e:
+            logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
+    
 
 class Protocol(asynchat.async_chat):
     """
@@ -124,6 +137,40 @@ class Protocol(asynchat.async_chat):
     Derived classes are expected to implement (at least) handle_close,
     to tidy up any connection state on destruction of the
     communications channel.
+
+    The primary state machine is driven by incoming protocol data on
+    the socket.  Commands are receieve and parsed, which triggers
+    invocation of methods and local processing, which sends response
+    commands and data.  Normally, between receiving incoming command
+    and data (and sending back the response command and data), the
+    socket is idle.  Local threads are not allowed to invoke
+    send_command, as this is not thread-safe and could interleave data
+    if a response command is being sent at the same time a local
+    thread invokes send_command.  
+
+    In these intervals, a secondary "back channel" is available, via
+    calls to queue_command(command,data,callback).  These transmissions
+    of (command, data) are scheduled (thread-safely), and are
+    guaranteed to be transmitted *between* normal outgoing command
+    responses.  If a response ultimately is received, it is passed to
+    the callback provided in the original call.  A unique key is
+    generated and sent, to re-associate the response with the command.
+
+    If we simply enqueued the data for future transmission, and the
+    asyncore loop wasn't *already* waiting for writability on the
+    socket (due to existing outgoing data in the FIFO), it could be an
+    indeterminate amount of time before the asyncore loop awoke from
+    select/poll.  We must have a thread-safe means to invoke
+    async_chat.push with new data (and invoke async_chat.initiate_send
+    and ultimately socket.send), from another thread, while
+    asyncore.loop is asleep (or even when awake, iff it is doing
+    something not send related)
+
+    Therefore, we have a 'sending' lock that we use to synchronize
+    with the asyncore.loop thread; asyncore.loop holds the thread any
+    time it is dealing with putting things ONTO the async_chat outgoing
+    FIFO (and calling initiate_send); we hold it while our thread is
+    putting things onto the FIFO (and calling initiate_send).
     """
     def __init__(self, sock=None, map=None):
         """
@@ -144,7 +191,7 @@ class Protocol(asynchat.async_chat):
                 # custom socket map thru to asyncore.dispatcher...
                 # So, we have to intercept the global socket_map,
                 # __init__ it, and fix it up after.
-                logging.debug( "Pre-2.6 asynchat; intercepting socket map: %s" % e )
+                logging.debug("Pre-2.6 asynchat; intercepting socket map: %s" % e)
                 try:
                     save_asm = asyncore.socket_map
                     asyncore.socket_map = map
@@ -152,12 +199,125 @@ class Protocol(asynchat.async_chat):
                 finally:
                     asyncore.socket_map = save_asm
 
-
         self.set_terminator("\n")
         self.buffer = []
         self.auth = None
         self.mid_command = False
+        self.send_lock = threading.Lock()
+        self.send_known = False
+        self.name("Protocol")
 
+    def name(self, what = None):
+        """
+        Some human-readable name for this Protocol endpoint, including
+        the local interface, port:
+        
+            name@iface:port
+
+        Only updates name if non-empty what is provided, and also
+        updates .locl if connected.
+        """
+        if what:
+            self._name = what
+        if self.connected:
+            self.locl = self.socket.getsockname()
+        else:
+            self.locl = (None, None)
+        return self._name + '@' + str(self.locl[0]) + ':' + str(self.locl[1] )
+
+    def authenticated(self):
+        return self.auth == "Done"
+
+    # ----------------------------------------------------------------------
+    # send_lock synchronized methods
+    # 
+    #      These deal in async_chat's outgoing FIFO, and allow external 
+    # thread's to send commands via send_back_channel().
+    # 
+    def writable(self):
+        with self.send_lock:
+            self.send_known = asynchat.async_chat.writable(self)
+        return self.send_known
+
+    def handle_write(self):
+        with self.send_lock:
+            asynchat.async_chat.handle_write(self)
+
+    def push(self, data):
+        with self.send_lock:
+            asynchat.async_chat.push(self, data)
+
+    def push_with_producer(self, producer):
+        with self.send_lock:
+            asynchat.async_chat.push_with_producer(self, producer)
+
+    def send_back_channel(self, command, data=None, timeout=None):
+        """
+        Arrange for another thread (NOT the asyncore.loop) to send a
+        command.  If there is already data awaiting transmission, we
+        are done; the asyncore.loop will take it from here. 
+
+        However, if the asyncore.loop is blocked (indeterminately!) on
+        read, it may *never* wake up to send this data!  We must usher
+        it out, 'til we know that the asyncore.loop discovered our
+        writability...
+
+        So, loop here (None ==> no timeout, 0. ==> no waiting),
+        attempting to send the data, 'til either we're done (no longer
+        writable()), or asyncore.loop discovers this fact!
+        """
+        begun = timer()
+        self.send_command(command, data)
+        while self.connected and not self.send_known:
+            # asyncore.loop's select doesn't think we need to write,
+            # but the socket is connected (and hasn't been closed).
+            # Exceptions during attempting to send will flow back to
+            # the caller.
+            with self.send_lock:
+                if asynchat.async_chat.writable(self):
+                    # asyncore.loop doesn't (yet) know we need to
+                    # write, and we know that we need to....
+                    logging.debug("%s -- back-channel initiating send @ %.6f" % (
+                            self.name(), timer() - begun))
+                    self.initiate_send()
+                    writable = asynchat.async_chat.writable(self)
+                    if self.send_known or not writable:
+                        # asyncore.loop knows now, or we're empty; done.
+                        if self.send_known and writable:
+                            logging.info("%s -- back-channel handed off I/O  @ %.6f" % (
+                                    self.name(), timer() - begun))
+                        break
+                else:
+                    # asyncore.loop emptied us; we're done.
+                    break
+
+            # We checked, tried to send, and checked again; we still
+            # have data to send, and asyncore.loop's select still
+            # doesn't know about it!  If we have time, wait...
+            elapsed = timer() - begun
+            if timeout is not None and elapsed >= timeout:
+                break
+            
+            # We're not empty, and asyncore.loop doesn't know.  Any
+            # non-None and non-zero timeout has not yet elapsed.  If
+            # timeout is None or 0, it is used as-is; otherwise, the
+            # remaining duration is computed.  Wait a bit.
+            try:
+                logging.debug("%s -- back-channel blocking on writability @ %.6fs" % (
+                        self.name(), timer() - begun))
+                r, w, e = select.select([], [self._fileno], [self._fileno],
+                                        timeout and timeout - elapsed or timeout)
+                if e:
+                    break
+                logging.debug("%s -- back-channel reporting   writability @ %.6fs" % (
+                            self.name(), timer() - begun))
+            except select.error, err:
+                # Anything that wakes us up harshly will wake up the
+                # main loop's select.  Done (except ignore
+                # well-behaved interrupted system calls).
+                if err.arg[0] != errno.EINTR:
+                    break
+    
     def log_info(self, message, type):
         """
         The asyncore.dispatcher.log_info type='name' categorization
@@ -169,24 +329,54 @@ class Protocol(asynchat.async_chat):
         self.buffer.append(data)
 
     def send_command(self, command, data=None):
+        """
+        Compose a command, and push it onto the async_chat FIFO for
+        transmission.  This is thread-safe, even though async_chat
+        breaks the transmission into output buffer sized blocks in
+        pushd, and appends them to a FIFO; simultaneous calls to push
+        could interleave data, but are locked.  It ultimately
+        initiates an attempt to asyncore.dispatcher.send some data.
+
+        When any service is complete, the asyncore.loop service thread
+        will prepare to wait in select/poll, and will call writable(),
+        which will return True because there is data awaiting
+        transmission in the FIFO, so the service thread will awaken
+        and send data when there is outgoing buffer available on the
+        socket.
+        """
         if not ":" in command:
             command += ":"
         if data:
             pdata = pickle.dumps(data)
             command += str(len(pdata))
-            logging.debug( "<- %s( %s )" % ( command, repr.repr( data )))
+            logging.debug( "%s -->%s( %s )" % (self.name(), command, repr.repr(data)))
             self.push(command + "\n" + pdata)
         else:
-            logging.debug( "<- %s" % command)
+            logging.debug( "%s -->%s" % (self.name(), command))
             self.push(command + "\n")
 
     def found_terminator(self):
-        if self.auth != "Done":
-            command, data = (''.join(self.buffer).split(":",1))
+        """
+        Collect an incoming command.  Allowed commands are of the
+        following forms:
+        
+        Un-authenticated commands:
+
+            <command>:<abitrary data>\n
+
+        Authenticated commands:
+            challenge:<arbitrary data>\n
+            <command>:length\n<length bytes of data>
+            
+        """
+        merged = ''.join(self.buffer)
+        if not self.authenticated():
+            logging.debug("%s<-- %s (unauthenticated!)" % (self.name(), merged))
+            command, data = merged.split(":", 1)
             self.process_unauthed_command(command, data)
         elif not self.mid_command:
-            logging.debug("-> %s" % ''.join(self.buffer))
-            command, length = (''.join(self.buffer)).split(":", 1)
+            logging.debug("%s<-- %s" % (self.name(), merged))
+            command, length = merged.split(":", 1)
             if command == "challenge":
                 self.process_command(command, length)
             elif length:
@@ -195,40 +385,65 @@ class Protocol(asynchat.async_chat):
             else:
                 self.process_command(command)
         else: # Read the data segment from the previous command
-            if self.auth != "Done":
+            if not self.authenticated():
                 logging.fatal("Recieved pickled data from unauthed source")
                 # sys.exit(1)
                 self.handle_close()
                 return
-            data = pickle.loads(''.join(self.buffer))
+            data = pickle.loads(merged)
             self.set_terminator("\n")
             command = self.mid_command
             self.mid_command = None
             self.process_command(command, data)
         self.buffer = []
 
+    # -------------------------------------------------------------------------
+    # Un-authenticated commands
+
     def send_challenge(self):
+        logging.debug("%s -- send_challenge" % self.name())
         self.auth = os.urandom(20).encode("hex")
         self.send_command(":".join(["challenge", self.auth]))
 
     def respond_to_challenge(self, command, data):
+        logging.debug("%s -- respond_to_challenge" % self.name())
         mac = hmac.new(self.password, data, hashlib.sha1)
         self.send_command(":".join(["auth", mac.digest().encode("hex")]))
         self.post_auth_init()
 
     def verify_auth(self, command, data):
+        logging.debug("%s -- verify_auth" % self.name())
         mac = hmac.new(self.password, self.auth, hashlib.sha1)
         if data == mac.digest().encode("hex"):
             self.auth = "Done"
-            logging.info("Authenticated other end")
+            logging.info("%s Authenticated other end" % self.name())
         else:
             self.handle_close()
 
+    # -------------------------------------------------------------------------
+    # Authenticated commands
+
+    # 
+    # Ping.  By default, expectes a (message, payload) and just
+    # returns a new message with the same payload.
+    #
     def respond_to_ping(self, command, data):
-        self.send_command(':'.join(['pong', 'Reply from %s' % os.gethostname()]))
+        try:
+            message, payload = data
+        except TypeError:
+            message = data
+            payload = None
+        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
+        message = "Reply from %s" % socket.getfqdn()
+        self.send_command("pong", (message, payload))
 
     def pong(self, command, data):
-        logging.info(command)
+        try:
+            message, payload = data
+        except TypeError:
+            message = data
+            payload = None
+        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
 
     def process_command(self, command, data=None):
         commands = {
@@ -308,6 +523,7 @@ class Client(Protocol):
         Protocol.__init__(self, map=map)
         self.mapfn = self.reducefn = self.collectfn = None
         self.closed = False
+        self.name("Client")
 
     def finished(self):
         return self.closed is True
@@ -341,21 +557,24 @@ class Client(Protocol):
         logging.info("Connecting to server at %s:%s" % (interface, port))
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connect((interface or "localhost", port))
-
+        self.name()
         if asynchronous is False:
             self.process()
 
-    def process(self):
+    def process(self, timeout=30.0):
         """
         Run this Client (and anything else sharing its _map), cleaning
-        it up on failure.
+        it up on failure.  The loop function may raise an exception,
+        but it will forcibly clean up all the map sockets on its way
+        out, so we don't have to worry about that (if it exits
+        cleanly, all map sockets were already cleaned up).
         """
         logging.debug("Client processing on map at %s: %s",
                       hex(id(self._map)), repr.repr(self._map))
-        loop(self._map)
+        loop(map=self._map)
 
     def handle_connect(self):
-        logging.info("Client initiating connection to Server...")
+        logging.info("Client connection to Server established")
         pass
 
     def handle_close(self):
@@ -400,7 +619,7 @@ class Client(Protocol):
         (key,[value,...])  item, or generators which operate over the
         sequence of all items (and hence may employ remembered state).
         """
-        logging.info("Mapping %s" % repr.repr( data[0] ))
+        logging.info("%s Mapping %s" % (self.name(), repr.repr(data[0])))
         results = {}
         for k, v in self.mapfn(data[0], data[1]):
             if k not in results:
@@ -440,7 +659,7 @@ class Client(Protocol):
         allows us to use the same function interchangably for
         collectfn, reducefn or finishfn (as appropriate).
         """
-        logging.info( "Reducing %s" % repr.repr( data ))
+        logging.info( "%s Reducing %s" % (self.name(), repr.repr(data)))
         rgen = applyover(self.reducefn, [data])
         results = list(rgen)
         if len(results) != 1:
@@ -462,13 +681,18 @@ class Client(Protocol):
             Protocol.process_command(self, command, data)
 
     def post_auth_init(self):
+        """
+        After Client has been authenticated by the Server, we will
+        initiate a challenge for authentication of the Server.
+        """
+        logging.debug("%s -- post_auth_init" % self.name())
         if not self.auth:
             self.send_challenge()
 
 
 class Server(asyncore.dispatcher, object):
     """
-    Server -- Distributes Map-Reduce tasks to authenticated clients.
+    Server -- Distributes Map/Reduce tasks to authenticated clients.
     
     The Map phase allocates a source key/value pair to a client, which
     applies the given Server.mapfn/.collectfn, and returns the
@@ -533,6 +757,7 @@ class Server(asyncore.dispatcher, object):
         self.collectfn = None
         self.reducefn = None
         self.finishfn = None
+        self.resultfn = None
         self.datasource = None
         self.password = None
         self.taskmanager = None
@@ -576,12 +801,8 @@ class Server(asyncore.dispatcher, object):
                    asynchronous=asynchronous)
 
         # If we are asynchronous, we have NOT initiated processing;
-        # caller must wait 'til we are finished() (or fail) before
-        # returning results; there are none to return, yet (use
-        # .finished() to discover if they are ready)
-        if asynchronous:
-            return None
-
+        # This will return None, if not finished(), or the results if
+        # we are were not asynchronous.
         return self.results()
 
     def conn(self, password="", port=DEFAULT_PORT, interface='',
@@ -593,8 +814,8 @@ class Server(asyncore.dispatcher, object):
 
         If asynchronous, then we will not initiate processing; it is
         the caller's responsibility to do so; every Client and/or
-        Server with a shared map=... require only one loop(obj._map)
-        or obj.process() thread.
+        Server with a shared map=... require only one
+        loop(map=obj._map) or obj.process() thread.
 
         The default behaviour of bind when interface == '' is pretty
         consistently to bind to all available interfaces.
@@ -636,11 +857,14 @@ class Server(asyncore.dispatcher, object):
     def process(self):
         """
         Run this Server (and anything else sharing its _map), cleaning
-        it up on failure.
+        it up on failure.  If the server runs to completion, the
+        self.resultfn() will be invoked, and the Server will tidily
+        close its connections, and this loop will exit.
+        
         """
         logging.debug("Server processing on map at %s: %s",
                       hex(id(self._map)), repr.repr(self._map))
-        loop(self._map)
+        loop(map=self._map)
 
     def finished(self):
         """
@@ -651,17 +875,10 @@ class Server(asyncore.dispatcher, object):
             and self.taskmanager.state == TaskManager.FINISHED
 
     def results(self):
-        # Successfully completed Map/Reduce.  If .finishfn supplied,
-        # support either .finishfn(iterator), or .finishfn(key,value),
-        # apply it -- the resultant values are assumed to be finished
-        # results, and are NOT encapsulated as a list.
-        results = self.taskmanager.results
-        if self.finishfn:
-            # Create a finished result dictionary by applying the
-            # supplied Server.finishfn over the Reduce results.  
-            rgen = applyover(self.finishfn, results.iteritems())
-            results = dict(rgen)
-        return results
+        # Successfully completed Map/Reduce.  Return results.
+        if not self.finished():
+            return None
+        return self.taskmanager.results
 
     def handle_accept(self):
         """
@@ -676,6 +893,7 @@ class Server(asyncore.dispatcher, object):
             sock, addr = self.accept()
         except TypeError:
             # sometimes accept() might return None (see issue 91)
+            # In Python 2.7+
             return
         except socket.error, err:
             # ECONNABORTED might be thrown on *BSD (see issue 105)
@@ -712,7 +930,7 @@ class Server(asyncore.dispatcher, object):
             if self.taskmanager:
                 for chan in self.taskmanager.channels.keys():
                     chan.tidy_close()
-
+        
     def handle_close(self):
         """
         EOF (or other failure) on our socket.  We have a chance to
@@ -759,7 +977,9 @@ class ServerChannel(Protocol):
         self.peer = addr
         self.server = server
         self.shutdown = False
-        logging.info( "Client %s connected" % ( str( self.peer )))
+        logging.info( "Channel %s connected to Client %s" % ( 
+                str(self.addr), str(self.peer)))
+        self.name("Server")         # OK, It's a Server's channel, but for logging...
         self.start_auth()
 
     def tidy_close(self):
@@ -778,11 +998,12 @@ class ServerChannel(Protocol):
             except: pass
 
     def handle_close(self):
-        logging.info( "Client %s disconnected" % str( self.peer ))
+        logging.info( "Channel disconnected to Client %s" % str( self.peer ))
         self.server.taskmanager.channel_closed(self)
         self.close()
 
     def start_auth(self):
+        logging.debug("%s -- start_auth" % self.name())
         self.send_challenge()
 
     def start_new_task(self):
@@ -791,7 +1012,7 @@ class ServerChannel(Protocol):
             return
         command, data = self.server.taskmanager.next_task(self)
         if command == None:
-            logging.info("Client %s idle" % ( self.peer ))
+            logging.info("Channel idle to Client %s" % ( self.peer ))
             return
         self.send_command(command, data)
 
@@ -821,6 +1042,18 @@ class ServerChannel(Protocol):
             Protocol.process_command(self, command, data)
 
     def post_auth_init(self):
+        """
+        After we have authenticated the Client, we expect it to
+        challenge the Server for authentication.  Once we have
+        responded (Protocol.respond_to_challenge has been invoked, and
+        the challenge response has been sent), it will invoke
+        post_auth_init, taking us here.
+
+        We assume that the Client is going to like our response, so we
+        can proceed to transmit configuration to the client.
+        
+        """
+        logging.debug("%s -- post_auth_init" % self.name())
         if self.server.mapfn:
             self.send_command('mapfn', self.store_func( self.server.mapfn ))
         if self.server.reducefn:
@@ -854,10 +1087,11 @@ class TaskManager:
 
     """
     # Possible .state
-    START	= 0
-    MAPPING	= 1
-    REDUCING	= 2
-    FINISHED	= 3
+    START	= 0		# Ready to start
+    MAPPING	= 1		# Performing Map phase of task
+    REDUCING	= 2		# Performing Reduce phase of task
+    FINISHING	= 3		# Performing finish phase, proparing results
+    FINISHED	= 4		# Final results available
 
     # Possible .tasks option
     MAPREDUCE	= 0
@@ -984,7 +1218,7 @@ class TaskManager:
                     # Skip Reduce phase, passing the key/value pairs
                     # output by Map straight to the result.
                     self.results = self.map_results
-                    self.state = TaskManager.FINISHED
+                    self.state = TaskManager.FINISHING
                     logging.debug('Server Finishing (skipping Reduce)')
                 else:
                     logging.debug('Server Reducing')
@@ -999,15 +1233,32 @@ class TaskManager:
                     key = random.choice(self.working_reduces.keys())
                     return ('reduce', (key, self.working_reduces[key]))
                 # No more entries left to Reduce; finish (self.results now valid)
-                self.state = TaskManager.FINISHED
+                self.state = TaskManager.FINISHING
+
+        if self.state == TaskManager.FINISHING:
+            # Map/Reduce Task done.` If .finishfn supplied, support
+            # either .finishfn(iterator), or .finishfn(key,value),
+            # apply it -- the resultant values are assumed to be
+            # finished results, and are NOT encapsulated as a list.
+            if self.server.finishfn:
+                # Create a finished result dictionary by applying the
+                # supplied Server.finishfn over the Reduce results.  
+                self.results \
+                    = dict( applyover(self.server.finishfn,
+                                      self.results.iteritems()))
+
+            self.state = TaskManager.FINISHED
 
         if self.state == TaskManager.FINISHED:
-            # Stop accepting new Client connections, and send a
-            # 'disconnect' to each client that asks for a new task.
-            # TODO: For PERMANENT TaskManagers, we do NOT want to
-            # close; in fact, we can remove this (and server
+            # All done; results ready.  Invoke optional .resultfn with
+            # results.  Stop accepting new Client connections, and
+            # send a 'disconnect' to each client that asks for a new
+            # task.  TODO: For PERMANENT TaskManagers, we do NOT want
+            # to close; in fact, we can remove this (and server
             # argument), and let the server itself decide when it
             # should shut down.
+            if self.server.resultfn:
+                self.server.resultfn( self.results )
             self.server.tidy_close()
             return ('disconnect', None)
     
@@ -1015,7 +1266,7 @@ class TaskManager:
         # Don't use the results if they've already been counted
         if not data[0] in self.working_maps:
             return
-        logging.debug( "Map Done: %s ==> %s" % ( data[0], repr.repr( data[1] )))
+        logging.debug("Map Done: %s ==> %s" % (data[0], repr.repr(data[1])))
         for (key, values) in data[1].iteritems():
             if key not in self.map_results:
                 self.map_results[key] = []
@@ -1026,9 +1277,131 @@ class TaskManager:
         # Don't use the results if they've already been counted
         if not data[0] in self.working_reduces:
             return
-        logging.debug( "Reduce Done: %s ==> %s" % ( data[0], repr.repr( data[1] )))
+        logging.debug("Reduce Done: %s ==> %s" % (data[0], repr.repr(data[1])))
         self.results[data[0]] = data[1]
         del self.working_reduces[data[0]]
+
+
+class Server_thread( threading.Thread ):
+    """
+    Run a Map/Reduce Server daemon, and process a single Map/Reduce task.
+
+    Raises exception on failure to create and connect a Server with
+    the given credentials (interface, port).  After start() is
+    invoked, it will drive stay in "processing" state 'til either
+    "success", or a "failed: ...".  
+    
+    When the state() reaches "success", results() may then be called.
+    Alternatively (or in addition), provide a 'resultfn' in the task
+    dictionary, and it will be invoked asynchronously with the
+    results, immediately on completion of the Map/Reduce task.
+    """
+    def __init__(self, credentials, task):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self._state = "idle"
+        self.server = Server(map={})
+        for k, v in task.iteritems():
+            setattr(self.server, k, v)
+        self.server.conn(asynchronous=True, **credentials)
+
+    def run(self):
+        self._state = "processing"
+        try:
+            self.server.process()
+        except Exception, e:
+            logging.error("Server failed: %s" % e)
+            self._state = "failed: %s" % e
+        else:
+            if self.server.finished():
+                self._state = "success"
+            else:
+                self._state = "failed: incomplete"
+
+    def finished(self):
+        return self.server.finished()
+
+    def results(self):
+        return self.server.results()
+
+    def state(self):
+        return self._state
+
+    def stop(self, timeout=5.):
+        """
+        Stop (and join) the Server thread (even if incomplete).
+
+        To stop a server, we'll have to make it close its connections,
+        which will cause its asyncore.loop to cease processing, and
+        its thread to stop.
+        
+        If the server doesn't tidily shut down within the timeout,
+        we'll take more forceful measures.  This could occur if a
+        client is frozen and won't respond to an EOF.
+        """
+        # It is safe (no-op) to invoke this multiple times
+        self.server.handle_close()
+        self.join( timeout )
+        if self.isAlive():
+            logging.warning("Could not stop Map/Reduce Server thread; forcing")
+        # Still not dead?  Some client must be frozen.  Try harder.
+        if self.isAlive():
+            close_all(map=self.server._map, ignore_all=True)
+            self.join()
+
+
+class Client_thread( threading.Thread ):
+    """
+    Run a Map/Reduce Client daemon.
+
+    Raises exception on the client's failure to bind to a Server.
+
+    After start(), processes 'til the processing loop completes, and
+    enters "success" state; if an exception terminates processing,
+    enters a "failure: ..." state.
+    """
+    def __init__(self, credentials):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self._state = "idle"
+        self.client = Client(map={})
+        self.client.conn(asynchronous=True, **credentials)
+
+    def run(self):
+        self._state = "processing"
+        try:
+            self.client.process()
+        except Exception, e:
+            logging.error("Client failed: %s" % e)
+            self._state = "failed: %s" % e
+        else:
+            # Normal exit; assume success
+            self._state = "success"
+
+    def send(self, command, data=None, timeout=None):
+        """
+        Send a command back to the Server via the back-channel, from
+        an external thread.
+        """
+        self.client.send_back_channel(command, data, timeout)
+
+    def state(self):
+        if self._state == "processing":
+            if self.client.authenticated():
+                self._state = "authenticated"
+        return self._state
+
+    def stop(self, timeout=5.):
+        """
+        Stop (and join) the client thread.
+        """
+        self.client.handle_close()
+        self.join( timeout )
+        if self.isAlive():
+            logging.warning("Could not stop Map/Reduce Client thread; forcing")
+            close_all(map=self.client._map, ignore_all=True)
+            self.join()
+
 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)
@@ -1047,7 +1420,6 @@ def run_client():
     client = Client()
     client.password = options.password
     client.conn( len(args) > 0 and args[0] or "", options.port)
-                      
 
 if __name__ == '__main__':
     run_client()
