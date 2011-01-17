@@ -125,7 +125,127 @@ def close_all(map=None, ignore_all=False):
             logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
     
 
-class Protocol(asynchat.async_chat):
+class threaded_async_chat(asynchat.async_chat):
+    """
+    Support multithreaded access to pushing data for transmission on
+    the async_chat FIFO.  If any other (non-asyncore.loop) thread
+    pushes data, it should probably invoke flush_back_channel.
+    Otherwise, the data may not be (completely) sent, until the
+    asyncore.loop awakens from its select/poll (due to other socket
+    events, or timeout), and notices that this socket has data to
+    send.
+
+    Also supports pre-2.6 asynchat, which didn't support a non-global
+    asyncore socket map.
+    """
+    def __init__(self, sock, map=None):
+        # Preserve pre-2.6 compatibility by avoiding map, iff None.
+        # Also first keyword name changed, so pass as simple arg...
+        if map is None:
+            asynchat.async_chat.__init__(self, sock)
+        else:
+            # However, if we must specify a custom map...
+            try:
+                asynchat.async_chat.__init__(self, sock, map=map)
+            except TypeError, e:
+                # ... before 2.6, async_chat wasn't updated to pass a
+                # custom socket map thru to asyncore.dispatcher...
+                # So, we have to intercept the global socket_map,
+                # __init__ it, and fix it up after.
+                logging.debug("Pre-2.6 asynchat; intercepting socket map: %s" % e)
+                try:
+                    save_asm = asyncore.socket_map
+                    asyncore.socket_map = map
+                    Protocol.__init__(self, sock)
+                finally:
+                    asyncore.socket_map = save_asm
+
+        self.send_lock = threading.Lock()
+        self.send_known = False
+
+    def writable(self):
+        with self.send_lock:
+            self.send_known = asynchat.async_chat.writable(self)
+        return self.send_known
+
+    def handle_write(self):
+        with self.send_lock:
+            asynchat.async_chat.handle_write(self)
+
+    def push(self, data):
+        with self.send_lock:
+            asynchat.async_chat.push(self, data)
+
+    def push_with_producer(self, producer):
+        with self.send_lock:
+            asynchat.async_chat.push_with_producer(self, producer)
+
+    def flush_back_channel(self, now = None, timeout = None):
+        """
+        Usher out pending async_chat FIFO data, 'til the asyncore.loop
+        thread acknowledges that it knows about it.
+
+        An optional timeout may be supplied; None implies no timeout
+        (wait until either no data remains, or asyncore.loop
+        acknowledges), or 0 (no delay; only invoke initiate_send once
+        to try to send some data, and then return immediately)
+        """
+        if now is None:
+            now = timer()
+        while not self.send_known:
+            # asyncore.loop's select doesn't think we need to write,
+            # but we need to ensure that our data is sent.  Exceptions
+            # during attempting to send will flow back to the caller.
+            with self.send_lock:
+                if asynchat.async_chat.writable(self):
+                    # asyncore.loop doesn't (yet) know we need to
+                    # write, and we know that we need to....
+                    logging.debug("%s -- back-channel initiating send @ %.6f" % (
+                            self.name(), timer() - now))
+                    self.initiate_send()
+                    writable = asynchat.async_chat.writable(self)
+                    if self.send_known or not writable:
+                        # asyncore.loop knows now, or we're empty; done.
+                        if self.send_known and writable:
+                            logging.info("%s -- back-channel handed off I/O  @ %.6f" % (
+                                    self.name(), timer() - now))
+                        break
+                else:
+                    # asyncore.loop emptied us; we're done.
+                    break
+
+            # We checked, tried to send, and checked again; we still
+            # have data to send, and asyncore.loop's select still
+            # doesn't know about it!  We are out of the lock now, so
+            # the asyncore.loop thread may now awaken (if it has
+            # detected some other activity), and then take note that
+            # there is data to send.  If we have time, wait...
+            elapsed = timer() - now
+            if timeout is not None and elapsed >= timeout:
+                break
+            
+            # We're not empty, and asyncore.loop doesn't yet know.
+            # Any non-None and non-zero timeout has not yet elapsed.
+            # If timeout is None or 0, it is used as-is; otherwise,
+            # the remaining duration is computed.  Wait a bit.
+            try:
+                logging.debug("%s -- back-channel blocking on writability @ %.6fs" % (
+                        self.name(), timer() - now))
+                r, w, e = select.select([], [self._fileno], [self._fileno],
+                                        timeout and timeout - elapsed or timeout)
+                if e:
+                    break
+                logging.debug("%s -- back-channel reporting   writability @ %.6fs" % (
+                            self.name(), timer() - now))
+            except select.error, err:
+                # Anything that wakes us up harshly will wake up the
+                # main loop's select.  Done (except ignore
+                # well-behaved interrupted system calls).
+                if err.arg[0] != errno.EINTR:
+                    break
+
+
+class Protocol(threaded_async_chat):
     """
     Implements the basic protocol used by mincement Client instances
     (back to one server), and ServerChannel instances (spawned by
@@ -178,33 +298,12 @@ class Protocol(asynchat.async_chat):
         socket map shared by all asyncore based objects to be activated
         using the same asyncore.loop.
         """
-        # Preserve pre-2.6 compatibility by avoiding map, iff None.
-        # Also first keyword name changed, so pass as simple arg...
-        if map is None:
-            asynchat.async_chat.__init__(self, sock)
-        else:
-            # However, if we must specify a custom map...
-            try:
-                asynchat.async_chat.__init__(self, sock, map=map)
-            except TypeError, e:
-                # ... before 2.6, async_chat wasn't updated to pass a
-                # custom socket map thru to asyncore.dispatcher...
-                # So, we have to intercept the global socket_map,
-                # __init__ it, and fix it up after.
-                logging.debug("Pre-2.6 asynchat; intercepting socket map: %s" % e)
-                try:
-                    save_asm = asyncore.socket_map
-                    asyncore.socket_map = map
-                    Protocol.__init__(self, sock)
-                finally:
-                    asyncore.socket_map = save_asm
+        threaded_async_chat.__init__(self, sock, map=map)
 
         self.set_terminator("\n")
         self.buffer = []
         self.auth = None
         self.mid_command = False
-        self.send_lock = threading.Lock()
-        self.send_known = False
         self.name("Protocol")
 
     def name(self, what = None):
@@ -228,121 +327,30 @@ class Protocol(asynchat.async_chat):
     def authenticated(self):
         return self.auth == "Done"
 
-    # ----------------------------------------------------------------------
-    # send_lock synchronized methods
-    # 
-    #      These deal in async_chat's outgoing FIFO, and allow external 
-    # thread's to send commands via send_back_channel().
-    # 
-    def writable(self):
-        with self.send_lock:
-            self.send_known = asynchat.async_chat.writable(self)
-        return self.send_known
-
-    def handle_write(self):
-        with self.send_lock:
-            asynchat.async_chat.handle_write(self)
-
-    def push(self, data):
-        with self.send_lock:
-            asynchat.async_chat.push(self, data)
-
-    def push_with_producer(self, producer):
-        with self.send_lock:
-            asynchat.async_chat.push_with_producer(self, producer)
-
-    def send_back_channel(self, command, data=None, timeout=None):
-        """
-        Arrange for another thread (NOT the asyncore.loop) to send a
-        command.  If there is already data awaiting transmission, we
-        are done; the asyncore.loop will take it from here. 
-
-        However, if the asyncore.loop is blocked (indeterminately!) on
-        read, it may *never* wake up to send this data!  We must usher
-        it out, 'til we know that the asyncore.loop discovered our
-        writability...
-
-        So, loop here (None ==> no timeout, 0. ==> no waiting),
-        attempting to send the data, 'til either we're done (no longer
-        writable()), or asyncore.loop discovers this fact!
-        """
-        begun = timer()
-        self.send_command(command, data)
-        while self.connected and not self.send_known:
-            # asyncore.loop's select doesn't think we need to write,
-            # but the socket is connected (and hasn't been closed).
-            # Exceptions during attempting to send will flow back to
-            # the caller.
-            with self.send_lock:
-                if asynchat.async_chat.writable(self):
-                    # asyncore.loop doesn't (yet) know we need to
-                    # write, and we know that we need to....
-                    logging.debug("%s -- back-channel initiating send @ %.6f" % (
-                            self.name(), timer() - begun))
-                    self.initiate_send()
-                    writable = asynchat.async_chat.writable(self)
-                    if self.send_known or not writable:
-                        # asyncore.loop knows now, or we're empty; done.
-                        if self.send_known and writable:
-                            logging.info("%s -- back-channel handed off I/O  @ %.6f" % (
-                                    self.name(), timer() - begun))
-                        break
-                else:
-                    # asyncore.loop emptied us; we're done.
-                    break
-
-            # We checked, tried to send, and checked again; we still
-            # have data to send, and asyncore.loop's select still
-            # doesn't know about it!  If we have time, wait...
-            elapsed = timer() - begun
-            if timeout is not None and elapsed >= timeout:
-                break
-            
-            # We're not empty, and asyncore.loop doesn't know.  Any
-            # non-None and non-zero timeout has not yet elapsed.  If
-            # timeout is None or 0, it is used as-is; otherwise, the
-            # remaining duration is computed.  Wait a bit.
-            try:
-                logging.debug("%s -- back-channel blocking on writability @ %.6fs" % (
-                        self.name(), timer() - begun))
-                r, w, e = select.select([], [self._fileno], [self._fileno],
-                                        timeout and timeout - elapsed or timeout)
-                if e:
-                    break
-                logging.debug("%s -- back-channel reporting   writability @ %.6fs" % (
-                            self.name(), timer() - begun))
-            except select.error, err:
-                # Anything that wakes us up harshly will wake up the
-                # main loop's select.  Done (except ignore
-                # well-behaved interrupted system calls).
-                if err.arg[0] != errno.EINTR:
-                    break
-    
-    def log_info(self, message, type):
-        """
-        The asyncore.dispatcher.log_info type='name' categorization
-        maps directly onto the logging.name; redirect.
-        """
-        getattr(logging,type)(message)
-
-    def collect_incoming_data(self, data):
-        self.buffer.append(data)
-
     def send_command(self, command, data=None):
         """
-        Compose a command, and push it onto the async_chat FIFO for
-        transmission.  This is thread-safe, even though async_chat
-        breaks the transmission into output buffer sized blocks in
-        pushd, and appends them to a FIFO; simultaneous calls to push
-        could interleave data, but are locked.  It ultimately
-        initiates an attempt to asyncore.dispatcher.send some data.
+        Allows the asyncore.loop thread to compose and send a command,
+        pushing it onto the async_chat FIFO for transmission.  This is
+        thread-safe (due to threaded_async_chat), even though
+        async_chat.push... breaks the transmission into output buffer
+        sized blocks in pushd, and appends them to a FIFO;
+        simultaneous calls to push could interleave data, but are
+        locked.  It ultimately initiates an attempt to
+        asyncore.dispatcher.send some data.
 
         When any service is complete, the asyncore.loop service thread
         will prepare to wait in select/poll, and will call writable(),
         which will return True because there is data awaiting
-        transmission in the FIFO, so the service thread will awaken
-        and send data when there is outgoing buffer available on the
-        socket.
+        transmission in the dispatcher's FIFO, so the loop service
+        thread will awaken and send data when there is outgoing buffer
+        available on the socket.
+
+        However, it may also be invoked by external threads, via
+        send_back_channel (below).  In that case, the asyncore.loop
+        thread (blocking in its own select/poll) will NOT know that
+        output is now ready for sending; until it awakens, the
+        external thread must ensure that the data gets sent
+
         """
         if not ":" in command:
             command += ":"
@@ -354,6 +362,45 @@ class Protocol(asynchat.async_chat):
         else:
             logging.debug( "%s -->%s" % (self.name(), command))
             self.push(command + "\n")
+
+    def send_back_channel(self, command, data=None, timeout=None):
+        """
+        Allows another thread (NOT the asyncore.loop) to compose and
+        send a command.  If the asyncore.loop thread knows that there
+        is already data awaiting transmission, we are done; the
+        asyncore.loop will take it from here.
+
+        However, if the asyncore.loop is blocked (indeterminately!) on
+        its select/pool awaiting events on other sockets, it may
+        *never* wake up to send this data!  We must usher it out, 'til
+        we know that the asyncore.loop discovered our socket's
+        writability...
+
+        So, loop here (None ==> no timeout, 0. ==> no waiting),
+        attempting to send the data, 'til either we're done (no longer
+        writable()), or asyncore.loop discovers this fact!
+        """
+        now = timer()
+        self.send_command(command, data)
+        self.flush_back_channel(now = now, timeout = timeout)
+
+    # ----------------------------------------------------------------------
+    # overridden async_chat methods
+    # 
+    #     The methods collect incoming data and implement the
+    # protocol.  They are invoked by the asyncore.loop thread due to
+    # I/O events detected on this socket, and invoke the appropriate
+    # callbacks as commands are received.
+    # 
+    def log_info(self, message, type):
+        """
+        The asyncore.dispatcher.log_info type='name' categorization
+        maps directly onto the logging.name; redirect.
+        """
+        getattr(logging,type)(message)
+
+    def collect_incoming_data(self, data):
+        self.buffer.append(data)
 
     def found_terminator(self):
         """
@@ -367,7 +414,6 @@ class Protocol(asynchat.async_chat):
         Authenticated commands:
             challenge:<arbitrary data>\n
             <command>:length\n<length bytes of data>
-            
         """
         merged = ''.join(self.buffer)
         if not self.authenticated():
@@ -399,7 +445,10 @@ class Protocol(asynchat.async_chat):
 
     # -------------------------------------------------------------------------
     # Un-authenticated commands
-
+    # 
+    #     The un-authenticated portion of the protocol, used to
+    # implement challenge-response authentication
+    # 
     def send_challenge(self):
         logging.debug("%s -- send_challenge" % self.name())
         self.auth = os.urandom(20).encode("hex")
@@ -422,12 +471,16 @@ class Protocol(asynchat.async_chat):
 
     # -------------------------------------------------------------------------
     # Authenticated commands
-
     # 
-    # Ping.  By default, expectes a (message, payload) and just
-    # returns a new message with the same payload.
-    #
+    #      After both ends of the channel have authenticated eachother, they may
+    # then use these commands.
+    # 
+    # 
     def respond_to_ping(self, command, data):
+        """
+        Ping.  By default, expectes a (message, payload) and just
+        returns a new message with the same payload.
+        """
         try:
             message, payload = data
         except TypeError:
@@ -438,6 +491,9 @@ class Protocol(asynchat.async_chat):
         self.send_command("pong", (message, payload))
 
     def pong(self, command, data):
+        """
+        Pong (response to Ping).
+        """
         try:
             message, payload = data
         except TypeError:
@@ -472,6 +528,13 @@ class Protocol(asynchat.async_chat):
             logging.critical("Unknown unauthed command received: %s" % (command,)) 
             self.handle_close()
         
+    # -------------------------------------------------------------------------
+    # function marshalling utilities
+    # 
+    #     After authentication, the protocol allows for functions and
+    # simple closures to be marshalled and transmitted.  These methods
+    # are used to dump and reconstitute methods.
+    # 
     def store_func(self, fun):
         """
         Pickle up simple, self-contained functions and closures (or
@@ -1063,7 +1126,7 @@ class ServerChannel(Protocol):
         self.server.taskmanager.channel_opened(self)
         self.start_new_task()
     
-class TaskManager:
+class TaskManager( object ):
     """
     Produce a stream of Map/Reduce tasks for all requesting
     ServerChannel channels. 
