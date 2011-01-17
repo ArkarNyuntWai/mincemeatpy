@@ -11,18 +11,16 @@ import time
 import sys
 
 '''
-example-sf-masterless	-- elect a server, become a client, schedule requests
+example-sf-daemon	-- elect a server, become a client, issue requests
 
     To run this test, simply start an instances of this script:
 
-        python example-sf-masterless.py
+        python example-sf-daemon.py
 
-It will spawn a client, and will detect that no server exists; it will
-then attempt to spawn a server in a separate thread, and again attempt
-to create a client.  Therefore, this test will actually create a
-server thread AND a client, and will complete on its own!  You may
-start other instances, to speed things up -- they will connect to the
-existing server, and will act as clients only...
+Each client may schedule Map-Reduce  for the server, and receive
+the results of those tasks sometime in the future.  Of course, each
+client also receives map and reduce tasks from the server.
+
 '''
 
 class file_contents(object):
@@ -187,32 +185,14 @@ reducefn = None
 finishfn = sum_values
 #finishfn = sum_values_generator
 
-addr_info = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT,
-}
-    
 
-def server(credentials, asynchronous=False, map=None):
-    """
-    Run a Map-Reduce Server, and process a single Map-Reduce task.
-
-    Raises exception on failure to create and run a Server, or
-    complete the task successfully.  If asynchronous, does not
-    initiate processing; use s.process().  After processing, call
-    s.results().
-    """
-    s = mincemeat.Server(map=map)
-
-    s.datasource = datasource
-    s.mapfn = mapfn
-    s.collectfn = collectfn
-    s.reducefn = reducefn
-    s.finishfn = finishfn
-
-    s.conn(asynchronous=asynchronous, **credentials)
-    return s
+# 
+# Result Callback
+# 
+#     Instead of monitoring the Server for completion, an optional
+# resultfn callback may be provided, which is invoked by the Server
+# immediately with the final results upon completion.
+# 
 
 def server_results(results):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
@@ -232,104 +212,144 @@ def server_results(results):
     for k, lt in zip(sorted(results.keys()), bycountlist):
         print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
 
+#resultfn = None
+resultfn = server_results
 
-def client(credentials, asynchronous=False, map=None):
-    c = mincemeat.Client(map=map)
-    logging.debug( "  Client._map at startup: %s" % (
-            repr.repr(c._map)))
-    c.conn(asynchronous=asynchronous, **credentials)
-    if asynchronous is False:
-        # Client communications with Server done; either server completed
-        # success, or exited without completing our authentication.
-        if not c.authenticated():
-            raise Exception( "Client couldn't authenticate!" )
-    return c
+
+addr_info = {
+    'password': 	'changeme',
+    'interface':	'localhost',
+    'port': 		mincemeat.DEFAULT_PORT,
+}
+
+task_spec = {
+    'datasource': 	datasource,
+    'mapfn':		mapfn,
+    'collectfn':	collectfn,
+    'reducefn':		reducefn,
+    'finishfn':		finishfn,
+    'resultfn':		resultfn,
+}
     
-def main_server_on_demand():
-    svr = None
-    svrthr = None
+def logchange( who, state, current ):
+    if current != state:
+        logging.info("%s was %s; now %s" % ( who, state, current ))
+    return current
+    
+def main():
     cli = None
+    clista = "(none)"
+    svr = None
+    svrsta = "(none)"
     try:
-        # If we fail to start a Client, try firing up a Server.  Since
-        # we don't know how long this might take, we may need to
-        # attempt creating a Client several times.
-        for _ in range(10):
-            try:
-                # Create a client.  This will block if we successfully
-                # connect, 'til the Server is done issuing the client
-                # Map-Reduce tasks...
-                cli = client(credentials  = addr_info,
-                             asynchronous = False,
-                             map          = {})
-                if cli.auth != 'Done':
-                    cli = None
-                    raise socket.error(errno.ENOTCONN, "Authentication failure")
-                break
-            except socket.error, e:
-                # No Server (yet).  Start one; if we've already
-                # started a Server thread, just wait a bit longer...
-                # We start this asynchronously, meaning that
-                # Server.conn() will return immediately (if it can
-                # successfully bind), and we'll start the svr.process
-                # in another thread.  This will continue processing
-                # 'til the Map-Reduce Transaction is complete (or an
-                # exception is thrown).  Both the client and the
-                # server have independent asyncore socket maps, so
-                # their service loops will run in independent threads.
-                logging.debug( "Client connection failed: %s" % e )
-                if not svr:
-                    # Create a Server, and (if successful), also a svrthr.
-                    try:
-                        svr = server(credentials  = addr_info,
-                                     asynchronous = True,
-                                     map          = {} )
-                    except socket.error, e:
-                        # The bind probably failed; Server couldn't
-                        # bind,...  Perhaps someone else beat us to it!
-                        pass
-                    else:
-                        # Server created and bound, no exception!  Ignite thread.
-                        svrthr = threading.Thread(target = svr.process)
-                        svrthr.start()
-                else:
-                    # svr and svrthr exist; wait on them a bit...
-                    svrthr.join(.1)
+        # If we fail to start a Client, try firing up a Server while
+        # continuing trying to fire up the Client.  Since we don't
+        # know how long this might take (including authentication), we
+        # may need to attempt creating a Client or a Server several
+        # times.
+        begun = time.clock()
+        limit = 5.0			# Wait for this time, total
+        cycle = 0.1			# Wait about this long per cycle
+        while time.clock() < begun + limit:
+            if not cli:
+                # No client yet? Create one.  May sometimes throw
+                # immediately, if non-blocking connect is unusually
+                # fast...
+                try:
+                    cli = mincemeat.Client_thread(credentials = addr_info)
+                    clista = logchange( "Client", clista, cli.state() )
+                    cli.start()
+                    clista = logchange( "Client", clista, cli.state() )
+                except Exception, e:
+                    logging.warning("Client thread failed: %s" % e)
 
-        # We've given the the 'ol college try; ensure we have had a
-        # Client!  Only leave one if its was successful.
-        if cli is None:
-            logging.error("Couldn't instantiate Client successfully")
+            time.sleep(cycle)
+
+            if cli:
+                # Client exists.  Keep checking state; must reach at
+                # least "authenticated"; may (if Server is quick),
+                # actually reach "success"!
+                clista = logchange( "Client", clista, cli.state() )
+                if cli.state() in ( "authenticated", "success" ):
+                    # Success!  Up and running.
+                    break
+                if clista.startswith("fail"):
+                    logging.warning("Client failed; trying again...")
+                    cli.stop(cycle)
+                    cli = None
+
+            if not svr:
+                # Client didn't come up and/or didn't immediately
+                # authenticate.  Create a Server.
+                try:
+                    svr = mincemeat.Server_thread(credentials = addr_info,
+                                                  task	      = task_spec)
+                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svr.start()
+                    svrsta = logchange( "Server", svrsta, svr.state() )
+                except Exception, e:
+                    # The bind probably failed; Server couldn't
+                    # bind,...  Perhaps someone else beat us to it!
+                    logging.warning("Server thread failed: %s" % e)
+
+            if svr:
+                svrsta = logchange( "Server", svrsta, svr.state() )
+                if svrsta.startswith("fail"):
+                    logging.warning("Server failed; trying again...")
+                    svr.stop(cycle)
+                    svr = None
+
+
+
+        # We've given the the 'ol college try, to start a Client;
+        # ensure we have had a Client!  If so, wait 'til it is done.
+        # If we (also) ran a Server_thread, it'll use the 'resultfn'
+        # callback to deliver the results.
+
+        if not cli or cli.state() != "authenticated":
+            logging.error("Client couldn't authenticate with Server")
+        else:
+            # Got an authenticated Client (and either a Server
+            # existed, or we spawned one.  Process 'til the client
+            # thread is done.  Send pings (with no timeout on
+            # transmission) every second.  This means that, upon failure to 
+            # transmit
+
+            while cli.isAlive():
+                clista = logchange( "Client", clista, cli.state() )
+                if svr:
+                    svrsta = logchange( "Server", svrsta, svr.state() )
+                begun = time.clock()
+                cli.send( "ping", ( "Request from %s" % socket.getfqdn(),
+                                    'x' * 1 * 1000 * 1000 ))
+                logging.info("Transmitted ping in %.4fs" % ( time.clock() - begun ))
+                time.sleep( 1 )
+
+            # Done! Client has exited.
 
     except KeyboardInterrupt:
-        # Manual shutdown; close any Client and/or Server.  This should
-        # cause their asyncore.loop to cease.
+        logging.info("Manual shutdown requested")
+
+    finally:
+        # Exception, Manual shutdown (eg. KeyboardInterrupt), or
+        # normal exit; stop any Client and/or Server.  This will cause
+        # their asyncore.loop to cease.  Use the default timeouts.
         if svr:
-            try:    svr.handle_close()
-            except: pass
-        elif cli:
-            try:    cli.handle_close()
-            except: pass
+            svr.stop()
+        if cli:
+            cli.stop()
 
     # Ensure that everything exited cleanly.  The Server should be
     # done, and should have finished() and produced results().
-    if svr:
-        svrthr.join(1)
-        if svrthr.isAlive():
-            logging.error("Server thread didn't exit cleanly")
-        if not svr.finished():
-            logging.error("Server never finished; produced no results")
-        else:
-            # Server successfully produced results.
-            server_results(svr.results())
-            return 0
-        # Server failure
-        return 1
+    if cli and cli.state() != "success":
+        logging.error("Client thread didn't exit cleanly: %s" % cli.state())
+    if svr and svr.state() != "success":
+        logging.error("Server thread didn't exit cleanly: %s" % svr.state())
 
-    # Just a Client; success if we got one, and it didn't fail above.
-    return cli is not None
-        
+    return (    ( not cli or cli.state() == "success" ) 
+            and ( not svr or svr.state() == "success" ))
 
 if __name__ == '__main__':
     logging.basicConfig( level=logging.INFO )
-    sys.exit(main_server_on_demand())
+    sys.exit(main())
 

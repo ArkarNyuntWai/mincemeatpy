@@ -197,6 +197,11 @@ finishfn = None
 #finishfn = sum_values
 #finishfn = sum_values_generator
 
+
+# Specify an externally visible server network interface name instead
+# of "localhost", if you wish to try this example accross multiple
+# hosts.  Note that the empty string '' implies INADDR_ANY for bind, and
+# 
 addr_info = {
     'password': 	'changeme',
     'interface':	'localhost',
@@ -235,7 +240,8 @@ def server( credentials ):
         print "%8d %-40.40s %8d %s" % ( results[k], k, lt[0], lt[1] )
 
 def client( credentials ):
-    logging.debug( "  socket_map at client startup: %s" % ( repr.repr( asyncore.socket_map )))
+    logging.debug( "  socket_map at client startup: %s" % (
+            repr.repr( asyncore.socket_map )))
     c = mincemeat.Client()
     c.conn( **credentials )
     # Client communications with Server done; either server completed
@@ -244,20 +250,13 @@ def client( credentials ):
         raise Exception( "No server authenticated!" )
     
 if __name__ == '__main__':
-    #logging.basicConfig( level=logging.DEBUG )
     logging.basicConfig( level=logging.INFO )
 
-    # try:
-    #     server( addr_info )
-    # except socket.error, e:
-    #     # interface:port already bound; establish client connection
-    #     client( addr_info )
-
     try:
-        logging.debug( "Trying as client..." )
+        logging.info( "Trying as client..." )
         client( addr_info )
         # If we get here, we succeeded in connecting and authenticating...
-        logging.debug( "Client terminating normally" )
+        logging.info( "Client terminating normally" )
     except:
-        logging.debug( "Trying as server..." )
+        logging.info( "Trying as server..." )
         server( addr_info )

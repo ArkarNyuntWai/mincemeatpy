@@ -3,9 +3,132 @@ mincemeat.py: MapReduce on Python
 mincemeat.py is licensed under the MIT license. See LICENSE for more details
 
 
-Run the example with:
-python example.py
+REQUIREMENTS
+
+Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/haslib/sha1
+
+
+EXAMPLES
+
+Run the basic example with:
+
+    python example.py
 
 and a worker with:
-python mincemeat.py -p changeme [server address]
+
+    python mincemeat.py -p changeme [server address (default "localhost")]
+
+
+The example-sf-... examples require the Gutenberg SF CD, or some other
+set of big *.txt files, in:
+
+     ../Gutenberg SF CD/Gutenberg SF/*.txt
+
+Download the Gutenberg SF CD using Bit Torrent, from:
+
+    http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
+
+Unzip the ISO, mount it, and copy (or symbolic link, on Posix
+platforms) it in the directory above where you've cloned the
+mincemeatpy repository; name it "Gutenberg SF CD".
+
+
+* Skipping the Reduce Phase
+
+The first Big Corpus example illustrates replacing a trivial Reduce
+phase with a "finish" function executed in the server node.  Start a
+server (binds to all available interfaces):
+
+   python example-sf-maponly.py
+
+and worker(s) with:
+
+    python mincemeat.py -p changeme [server address (default "localhost")
+
+
+* Dynamically Electing a Server
+
+The next examples illustrate various means of dynamically spawning a
+server, if necessary.  They all bind to "localhost" by default (change
+addr_info in the text to specify another server host interface name).
+Each instance run elects itself to be the server, if necessary, or
+becomes a client.  Start multiple instances on the same host:
+
+    python example-sf-election.py
+
+and workers(s) with:
+
+    python example-sf-election.py
+or
+    python mincemeat.py -v -p changeme
+
+
+* Multithreaded Clients/Servers
+
+The example-sf-masterless.py example runs both a client thread and a
+server thread (if necessary), in the same instance, to illustrate how
+one might build a dynamic, robust Map-Reduce grid, when we don't have
+control over the lifespan of the instances (eg. a web server farm,
+...).
+
+    python example-sf-masterless.py
+
+This will run a client and a server!  To speed it up, create more
+clients by running the same command.
+
+
+TOPOLOGY
+
+    In its most simple form, a Map-Reduce cluster has a Server and
+several (perhaps transient) Clients.  The server configures the Client
+appropriately, sends one or more Map and/or Reduce requests to the
+Client, collecting the results.  If the Client fails without returning
+the result, the Server will (eventually) send the same Map/Reduce
+requests to another Client.  When complete, the Server disconnects
+from all Clients and exits.  In all cases, the Server is in control of
+the lifespan of the Clients, and also schedules all of the Map/Reduce
+Tasks, and all constituent Map/Reduce Transactions.
+
+               +-------(C)
+              /
+             v
+            (S)<--------(C)
+             ^
+              \
+               +-----(C)
+
+
+    In other typical uses of Map-Reduce, the Clients might be in
+control.  For example, if you have a web server farm with many clients
+created spontaneously by the web server infrastructure, where any each
+process will be a Map-Reduce Client, and any Client may need to
+schedule some Map/Reduce task to be processed across all other
+Clients.  In this case, a Server needs to be elected from among the
+Clients (if none exists yet); another Server may need to be
+re-elected, should one disappear before (or during) processing of some
+Client's task.  Since the Server binds atomically and unilaterally to
+a port, any Client could spawn a thread to implement a Server when it
+fails to connect to an existing one.  Here is an example of a Client
+connecting to a Server hosted as a thread within the same process:
+
+               +-------(C)
+              /
+             v
+        (C->(S))<--------(C)
+             ^
+              \
+               +-----(C)
+
+    After that server node fails, the Clients connect to a new one;
+the first one to detect the failure attempts to reconnect and then
+fails, and will spawn a Server thread:
+
+                       (C)-+
+                            \
+                             v
+        (XXXXX)         (C->(S))
+                             ^
+                            /
+                     (C)---+
+
 
