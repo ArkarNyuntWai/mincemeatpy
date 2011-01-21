@@ -238,6 +238,40 @@ def logchange( who, previous ):
         logging.info("%s was %s; now %s" % ( who.name(), previous, current ))
     return current
     
+
+# Use the main service thread timeout facility to send commands; NOT
+# send_back_channel, as required for externally-initiated commands!
+
+class Cli(mincemeat.Client_thread):
+    def __init__(self, *args, **kwargs):
+        mincemeat.Client_thread.__init__(self, *args, **kwargs)
+
+    def timeout(self, more):
+        """
+        The Client_thread's process (asyncore.loop) thread is invoking
+        us; use send_command, NOT send_command_backchannel.
+        """
+        logging.info("%s timeout %s" % (
+                self.name(), not more and "done" or ""))
+        self.mincemeat.send_command("ping", ( "Client Timeout from %s" % (
+                    socket.getfqdn()), None ) )
+
+class Svr(mincemeat.Server_thread):
+    def __init__(self, *args, **kwargs):
+        mincemeat.Server_thread.__init__(self, *args, **kwargs)
+
+    def timeout(self, more):
+        """
+        The Server_thread's process (asyncore.loop) thread is invoking
+        us; it also runs all the Server's ServerChannel's; hence, we
+        use send_command, NOT send_command_backchannel.
+        """
+        logging.info("%s timeout %s" % (
+                self.name(), not more and "done" or ""))
+        for chan in self.mincemeat.taskmanager.channels.keys():
+            chan.send_command("ping", ( "Server Timeout from %s" % (
+                        socket.getfqdn()), None ) )
+
 def main():
     cli = None
     clista = "(none)"
@@ -258,7 +292,8 @@ def main():
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = mincemeat.Client_thread(credentials = addr_info)
+                    cli = Cli(credentials=addr_info, 
+                              timeout=5.0)
                     clista = logchange( cli, clista )
                     cli.start()
                     clista = logchange( cli, clista )
@@ -285,8 +320,8 @@ def main():
                 # Client didn't come up and/or didn't immediately
                 # authenticate.  Create a Server.
                 try:
-                    svr = mincemeat.Server_thread(credentials = addr_info,
-                                                  task	      = task_spec)
+                    svr = Svr(credentials=addr_info,
+                              task=task_spec, timeout=5.0)
                     svrsta = logchange( svr, svrsta )
                     svr.start()
                     svrsta = logchange( svr, svrsta )
@@ -322,10 +357,10 @@ def main():
                 if svr:
                     svrsta = logchange( svr, svrsta )
                 begun = time.clock()
-                cli.send_back_channel( "ping",
-                                       ( "Request from %s" % socket.getfqdn(),
-                                         'x' * 1 * 1000 * 1000 ))
-                time.sleep( 1 )
+                cli.mincemeat.send_command_backchannel(
+                    "ping", ( "Request from %s" % (
+                            socket.getfqdn()), 'x' * 1 * 1000 * 1000 ))
+                time.sleep( 5 )
 
             # Done! Client has exited.
 

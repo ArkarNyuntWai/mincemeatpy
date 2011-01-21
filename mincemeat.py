@@ -84,26 +84,6 @@ def applyover(func, itr):
     except TypeError:
         return generator(func)(itr)
 
-def loop(timeout=30.0, use_poll=False, map=None, count=None):
-    """
-
-    """
-    try:
-        asyncore.loop(timeout=timeout, use_poll=use_poll,
-                      map=map, count=count)
-    except:
-        # We're no longer running asyncore.loop, so can't do anything
-        # cleanly; just close 'em all...  This should ensure that any
-        # socket resources associated with this object get cleaned up.
-        # In order to ensure that the original error context gets
-        # raised, even if the asyncore.close_all fails, we must use
-        # re-raise inside a try-finally.
-        try:
-            raise
-        finally:
-            close_all(map=map, ignore_all=True)
-
-
 def process(timeout=None, map=None, schedule=None):
     """
     Processes asyncore based Server or Client events 'til none left,
@@ -151,11 +131,12 @@ def process(timeout=None, map=None, schedule=None):
             map = asyncore.socket_map		# Internal asyncore knowledg!
 
         beg = now = timer()
-        while map and ( timeout is None or now - beg >= timeout ):
-            # Events on 'map' still poyet ssible, and either 'timeout'
-            # is infinite, or we haven't exceeded it.  NOTE: We
+        dur = 0.0
+        while map and ( timeout is None or dur <= timeout ):
+            # Events on 'map' still possible, and either 'timeout' is
+            # infinite, or we haven't yet exceeded it.  NOTE: We
             # *always* want to do at least one cycle, even if timeout
-            # == 0!  Hence, the >=.
+            # == 0, hence the <= instead of <.
             exp = None
             if schedule:
                 # Dispatch expired scheduled events.  Any scheduled
@@ -168,11 +149,11 @@ def process(timeout=None, map=None, schedule=None):
                             fun()		# Timer expired; fire fun()!
                         else:
                             break		# Timer in future; done.
-                    except Exception, exc:
+                    except Exception, e:
                         # A scheduled event failed; this isn't
                         # considered fatal, but may be of interest...
                         logging.warning("Failed scheduled event %s: %s" % (
-                                fun, exc))
+                                fun, e))
                 
                     # This event was at or before now (and was fired);
                     # remove it and get next one (if any).  We'll
@@ -186,20 +167,20 @@ def process(timeout=None, map=None, schedule=None):
             # one that fired the break (if any) will limit expiry
             # timeout; 'now' is recently refreshed.  Deduce time that
             # 'remains'; None means no timeout.
-            remains = []
-            if exp is not None:
-                # A (finite) event awaits...
-                remains.append(exp - now)
-            if timeout is not None:
-                # A (finite) timeout defined...
-                duration = now - beg
-                remains.append(timeout - duration)
-            if remains:
-                remains = min(remains)
+            dur = now - beg
+            rem = []
+            if exp is not None:           	# A (finite) event awaits...
+                rem.append(exp - now)
+            if timeout is not None:             # A (finite) timeout defined...
+                rem.append(timeout - dur)
+            # Convert durations list to scalar minimum, None for inf.
+            if rem:
+                rem = min(rem)
             else:
-                remains = None
-            asyncore.loop(timeout=remains, map=map, count=1)
+                rem = None
+            asyncore.loop(timeout=rem, map=map, count=1)
             now = timer()
+            dur = now - beg
 
     except:
         # We're no longer running asyncore.loop, so can't do anything
@@ -232,15 +213,16 @@ def close_all(map=None, ignore_all=False):
         # Support pre-2.6 asyncore; no ignore_all...
         try: 
             asyncore.close_all(map=map)
-        except Exception, exc:
-            logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % exc )
+        except Exception, e:
+            logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
     
+
 
 class threaded_async_chat(asynchat.async_chat):
     """
     Support multithreaded access to pushing data for transmission on
     the async_chat FIFO.  If any other (non-asyncore.loop) thread
-    pushes data, it should probably invoke flush_back_channel.
+    pushes data, it should probably invoke flush_backchannel.
     Otherwise, the data may not be (completely) sent, until the
     asyncore.loop awakens from its select/poll (due to other socket
     events, or timeout), and notices that this socket has data to
@@ -318,7 +300,7 @@ class threaded_async_chat(asynchat.async_chat):
         with self.send_lock:
             asynchat.async_chat.push_with_producer(self, producer)
 
-    def flush_back_channel(self, now=None, timeout=None):
+    def flush_backchannel(self, now=None, timeout=None):
         """
         Usher out pending async_chat FIFO data, 'til the asyncore.loop
         thread acknowledges that it knows about it.
@@ -420,9 +402,9 @@ class threaded_async_chat(asynchat.async_chat):
                                  self.name(), str(self.addr)))
                          self.socket.shutdown(socket.SHUT_WR)
                          return True
-                except Exception, exc:
+                except Exception, e:
                     logging.warning("%s shut down failed: %s" % (
-                            self.name(), exc ))
+                            self.name(), e ))
             else:
                 logging.info("%s shut down at EOF!" % self.name())
         else:
@@ -455,10 +437,11 @@ class Protocol(threaded_async_chat):
     thread invokes send_command.  
 
     In these intervals, a secondary "back channel" is available, via
-    calls to send_back_channel(command,data).  These transmissions of
-    (command, data) are scheduled (thread-safely), and are guaranteed
-    to be transmitted *between* normal outgoing command responses (due
-    to serializing the underlying async_chat.push.)
+    calls to send_command_backchannel(command,data).  These
+    transmissions of (command, data) are scheduled (thread-safely),
+    and are guaranteed to be transmitted *between* normal outgoing
+    command responses (due to serializing the underlying
+    async_chat.push.)
 
     If we simply enqueued the data for future transmission, and the
     asyncore loop wasn't *already* waiting for writability on the
@@ -469,7 +452,7 @@ class Protocol(threaded_async_chat):
     async_chat.initiate_send and socket.send), from another thread,
     while asyncore.loop is asleep (or even when awake, iff it is doing
     something not output FIFO related).  That is where
-    flush_back_channel() comes in...
+    flush_backchannel() comes in...
     """
     def __init__(self, sock=None, map=None, schedule=None, shuttout=None):
         """
@@ -560,11 +543,11 @@ class Protocol(threaded_async_chat):
         outgoing buffer available on the socket.
 
         This interface may also be invoked by external threads, via
-        send_back_channel (below).  In that case, the asyncore.loop
-        thread (blocking in its own select/poll) will NOT know that
-        output is now ready for sending; until it awakens, the
-        external thread must ensure that the data gets sent, using
-        flush_back_channel.
+        send_command_backchannel (below).  In that case, the
+        asyncore.loop thread (blocking in its own select/poll) will
+        NOT know that output is now ready for sending; until it
+        awakens, the external thread must ensure that the data gets
+        sent, using flush_backchannel.
         """
         if not ":" in command:
             command += ":"
@@ -577,7 +560,7 @@ class Protocol(threaded_async_chat):
             logging.debug( "%s -->%s" % (self.name(), command))
             self.push(command + "\n")
 
-    def send_back_channel(self, command, data=None, timeout=None):
+    def send_command_backchannel(self, command, data=None, timeout=None):
         """
         Allows another thread (NOT the asyncore.loop) to compose and
         send a command.  If the asyncore.loop thread knows that there
@@ -596,7 +579,7 @@ class Protocol(threaded_async_chat):
         """
         now = timer()
         self.send_command(command, data)
-        self.flush_back_channel(now=now, timeout=timeout)
+        self.flush_backchannel(now=now, timeout=timeout)
 
     # ----------------------------------------------------------------------
     # overridden async_chat methods
@@ -1149,7 +1132,7 @@ class Server(asyncore.dispatcher, object):
         If asynchronous, then we will not initiate processing; it is
         the caller's responsibility to do so; every Client and/or
         Server with a shared map=... require only one
-        loop(map=obj._map) or obj.process() thread.
+        asyncore.loop(map=obj._map) or obj.process() thread.
 
         The default behaviour of bind when interface == '' is pretty
         consistently to bind to all available interfaces.
@@ -1250,16 +1233,16 @@ class Server(asyncore.dispatcher, object):
         """
         try:
             self.close()
-        except Exception, exc:
+        except Exception, e:
             logging.warning("%s closing main port failed: %s" % (
-                    self.name(), exc))
+                    self.name(), e))
         if self.taskmanager:
             for chan in self.taskmanager.channels.keys():
                 try:
                     chan.handle_close()
-                except Exception, exc:
+                except Exception, e:
                     logging.warning("%s closing %s failed: %s" % ( 
-                            self.name(), chan.name(), exc ))
+                            self.name(), chan.name(), e ))
 
     def handle_expt(self):
         """
@@ -1600,10 +1583,13 @@ class mincemeat_daemon(threading.Thread):
     A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
     numeric 'timeout' on creation will cause timeout() to be fired
     about every that many seconds.
-    
+
+    Note that an overloaded Thread.run does *not* receive *args or
+    **kwargs!  Only a target method does...
     """
     def __init__(self, *args, **kwargs):
-        threading.Thread.__init__(self, *args, **kwargs)
+        threading.Thread.__init__(self, target=self.process,
+                                  args=args, kwargs=kwargs)
         self.daemon = True
         self._state = "idle"
         if not hasattr(self, 'is_alive'):
@@ -1623,31 +1609,12 @@ class mincemeat_daemon(threading.Thread):
                 self._state = "authenticated"
         return self._state
 
-    def run(self, *args, **kwargs):
+    def process(self, *args, **kwargs):
         """
         Invoke the event processing on the mincemeat Client or Server.
         Any extraneous arguments passed to the constructor are assumed
         to be arguments to .process(...)
-        """
-        self._state = "processing"
-        logging.info("%s thread started: %s" % (
-                self.mincemeat.name(), self.state()))
-        try:
-            self.process(*args, **kwargs)
-        except Exception, e:
-            logging.error("%s failed: %s" % (self.mincemeat.name(), e))
-            self._state = "failed: %s" % e
-        else:
-            # Normal exit; if finished(), assume success
-            if self.mincemeat.finished():
-                self._state = "success"
-            else:
-                self._state = "failed: incomplete"
-        logging.info("%s thread stopping: %s" % (
-                self.mincemeat.name(), self.state()))
 
-    def process(self, *args, **kwargs):
-        """
         Default processing loop.  With no args, will simply process
         with no timeout, 'til underlying mincemeat object is finished
         (its asyncore.dispatcher._map is empty).
@@ -1656,15 +1623,31 @@ class mincemeat_daemon(threading.Thread):
         'timeout' keyword arg to class consructor (eg. { 'timeout':
         30.0 }), to implement a timed event-loop.
         """
-        while self.mincemeat.process(*args, **kwargs):
-            self.timeout(True)
-        self.timeout(False)
+        logging.info("%s processing(%s, %s)" % (
+                self.name(), repr.repr(args), repr.repr(kwargs)))
+        self._state = "processing"
+        try:
+            while self.mincemeat.process(*args, **kwargs):
+                self.timeout(True)
+            self.timeout(False)
+        except Exception, e:
+            logging.error("%s failed: %s" % (self.name(), e))
+            self._state = "failed: %s" % e
+        else:
+            # Normal exit; if finished(), assume success
+            if self.mincemeat.finished():
+                self._state = "success"
+            else:
+                self._state = "failed: incomplete"
+        logging.info("%s stopping: %s" % (
+                self.name(), self.state()))
 
-    def timeout(self, done):
+    def timeout(self, more):
         """
         Override in derived class (and pass a numeric 'timeout'
         keyword argument on daemon creation), if a timed event-loop is
-        desired.
+        desired.  It is invoked with more=True, 'til the event loop
+        detects completion.
         """
         pass
 
@@ -1688,6 +1671,7 @@ class mincemeat_daemon(threading.Thread):
             close_all(map=self.mincemeat._map, ignore_all=True)
             self.join()
 
+
 class Server_thread(mincemeat_daemon):
     """
     Run a Map/Reduce Server daemon, and process a single Map/Reduce task.
@@ -1702,11 +1686,12 @@ class Server_thread(mincemeat_daemon):
     dictionary, and it will be invoked asynchronously with the
     results, immediately on completion of the Map/Reduce task.
     """
-    def __init__(self, credentials, task, map=None, **kwargs):
-        mincemeat_daemon.__init__(self, **kwargs)
+    def __init__(self, credentials, task, map=None, *args, **kwargs):
+        mincemeat_daemon.__init__(self, *args, **kwargs)
         if map is None:
             map = {}
-        self.mincemeat = Server(map=map, schedule=collections.deque(), shuttout=5.)
+        self.mincemeat = Server(map=map, schedule=collections.deque(),
+                                shuttout=5.)
         for k, v in task.iteritems():
             setattr(self.mincemeat, k, v)
         self.mincemeat.conn(asynchronous=True, **credentials)
@@ -1725,7 +1710,9 @@ class Client_thread(mincemeat_daemon):
     then remember that this thread's run method will process the
     asyncore.loop, and will therefore process events on other sockets
     in the map; no other asyncore.loop should be invoked with this
-    map!
+    map!  Any additional keyword args are (ultimately) passed to the
+    Thread.run() method (eg. 'timeout', to produced a periodic
+    invocation of the timeout() method)
 
     Raises exception on the client's failure to bind to a Server.
 
@@ -1733,20 +1720,13 @@ class Client_thread(mincemeat_daemon):
     enters "success" state; if an exception terminates processing,
     enters a "failure: ..." state.
     """
-    def __init__(self, credentials, map=None, **kwargs):
-        mincemeat_daemon.__init__(self, **kwargs)
+    def __init__(self, credentials, map=None, *args, **kwargs):
+        mincemeat_daemon.__init__(self, *args, **kwargs)
         if map is None:
             map = {}
-        self.mincemeat = Client(map=map, schedule=collections.deque(), shuttout=5.)
+        self.mincemeat = Client(map=map, schedule=collections.deque(),
+                                shuttout=5.)
         self.mincemeat.conn(asynchronous=True, **credentials)
-
-    def send_back_channel(self, command, data=None, timeout=None):
-        """
-        Send a command back to the Server via the back-channel, from
-        an external thread.
-        """
-        self.mincemeat.send_back_channel(command, data, timeout)
-
 
 
 def run_client():
