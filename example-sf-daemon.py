@@ -8,6 +8,7 @@ import errno
 import asyncore
 import threading
 import time
+import traceback
 import sys
 
 '''
@@ -231,9 +232,10 @@ task_spec = {
     'resultfn':		resultfn,
 }
     
-def logchange( who, state, current ):
-    if current != state:
-        logging.info("%s was %s; now %s" % ( who, state, current ))
+def logchange( who, previous ):
+    current = who.state()
+    if current != previous:
+        logging.info("%s was %s; now %s" % ( who.name(), previous, current ))
     return current
     
 def main():
@@ -257,11 +259,12 @@ def main():
                 # fast...
                 try:
                     cli = mincemeat.Client_thread(credentials = addr_info)
-                    clista = logchange( "Client", clista, cli.state() )
+                    clista = logchange( cli, clista )
                     cli.start()
-                    clista = logchange( "Client", clista, cli.state() )
+                    clista = logchange( cli, clista )
                 except Exception, e:
-                    logging.warning("Client thread failed: %s" % e)
+                    logging.warning("Client thread failed: %s\n%s" % (
+                            e, traceback.format_exc()))
 
             time.sleep(cycle)
 
@@ -269,7 +272,7 @@ def main():
                 # Client exists.  Keep checking state; must reach at
                 # least "authenticated"; may (if Server is quick),
                 # actually reach "success"!
-                clista = logchange( "Client", clista, cli.state() )
+                clista = logchange( cli, clista )
                 if cli.state() in ( "authenticated", "success" ):
                     # Success!  Up and running.
                     break
@@ -284,16 +287,16 @@ def main():
                 try:
                     svr = mincemeat.Server_thread(credentials = addr_info,
                                                   task	      = task_spec)
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svrsta = logchange( svr, svrsta )
                     svr.start()
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svrsta = logchange( svr, svrsta )
                 except Exception, e:
                     # The bind probably failed; Server couldn't
                     # bind,...  Perhaps someone else beat us to it!
                     logging.warning("Server thread failed: %s" % e)
 
             if svr:
-                svrsta = logchange( "Server", svrsta, svr.state() )
+                svrsta = logchange( svr, svrsta )
                 if svrsta.startswith("fail"):
                     logging.warning("Server failed; trying again...")
                     svr.stop(cycle)
@@ -314,15 +317,14 @@ def main():
             # thread is done.  Send pings (with no timeout on
             # transmission) every second.  This means that, upon failure to 
             # transmit
-
-            while cli.isAlive():
-                clista = logchange( "Client", clista, cli.state() )
+            while cli.is_alive():
+                clista = logchange( cli, clista )
                 if svr:
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svrsta = logchange( svr, svrsta )
                 begun = time.clock()
-                cli.send( "ping", ( "Request from %s" % socket.getfqdn(),
-                                    'x' * 1 * 1000 * 1000 ))
-                logging.info("Transmitted ping in %.4fs" % ( time.clock() - begun ))
+                cli.send_back_channel( "ping",
+                                       ( "Request from %s" % socket.getfqdn(),
+                                         'x' * 1 * 1000 * 1000 ))
                 time.sleep( 1 )
 
             # Done! Client has exited.
@@ -341,13 +343,14 @@ def main():
 
     # Ensure that everything exited cleanly.  The Server should be
     # done, and should have finished() and produced results().
+    code = 0
     if cli and cli.state() != "success":
         logging.error("Client thread didn't exit cleanly: %s" % cli.state())
+        code = 1
     if svr and svr.state() != "success":
         logging.error("Server thread didn't exit cleanly: %s" % svr.state())
-
-    return (    ( not cli or cli.state() == "success" ) 
-            and ( not svr or svr.state() == "success" ))
+        code = 1
+    return code
 
 if __name__ == '__main__':
     logging.basicConfig( level=logging.INFO )
