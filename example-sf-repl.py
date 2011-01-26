@@ -15,7 +15,7 @@ import select
 import sys
 
 """
-example-sf-repl		-- Client reads/schedules requests; Spawns Server if needed
+example-sf-repl         -- Client reads/schedules requests; Spawns Server if needed
 
     To run this test, simply start an instances of this script:
 
@@ -91,14 +91,14 @@ def get_lower_simple( k, v ):
 # 
 def sum_values( k, vs ):
     try:
-        return sum( vs )		# Will throw unless vs is iterable, summable
+        return sum( vs )                # Will throw unless vs is iterable, summable
     except TypeError:
         return vs
 
 def sum_values_generator( kvi ):
     for k, vs in kvi:
         try:
-            yield k, sum( vs )		# Will throw unless vs is iterable, summable
+            yield k, sum( vs )          # Will throw unless vs is iterable, summable
         except TypeError:
             yield k, vs
 
@@ -106,8 +106,9 @@ def sum_values_generator( kvi ):
 # 
 # Map Phase
 # 
-#     Each Map client runs a full pass of mapfn over the incoming data, followed
-# (optionally) by a pass of collectfn over all values for each Map data_key:
+#     Each Map client runs a full pass of mapfn over the incoming
+# data, followed (optionally) by a pass of collectfn over all values
+# for each Map data_key:
 # 
 # mapfn( source_key, data )
 #   --> { map_key1: [ value, ...] ), map_key2: [ value, ...], ... }
@@ -222,22 +223,22 @@ def server_results(results):
         print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
 
 #resultfn = None
-#resultfn = server_results	# Process directly (using asyncore.loop thread)
-resultfn = store_results	# Store for processing later
+#resultfn = server_results      # Process directly (using asyncore.loop thread)
+resultfn = store_results        # Store for processing later
 
 
 
 credentials = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT,
+    'password':         'changeme',
+    'interface':        'localhost',
+    'port':             mincemeat.DEFAULT_PORT,
 
-    'datasource': 	None,	# Causes TaskManager to stay idle
-    'mapfn':		mapfn,
-    'collectfn':	collectfn,
-    'reducefn':		reducefn,
-    'finishfn':		finishfn,
-    'resultfn':		resultfn,
+    'datasource':       None,   # Causes TaskManager to stay idle
+    'mapfn':            mapfn,
+    'collectfn':        collectfn,
+    'reducefn':         reducefn,
+    'finishfn':         finishfn,
+    'resultfn':         resultfn,
 }
     
 def logchange( who, previous ):
@@ -262,23 +263,71 @@ class Cli(mincemeat.Client_daemon):
         """
         The Client_daemon's process (asyncore.loop) thread is invoking
         us; use send_command; send_command_backchannel not necessary.
+
+        We just want to ensure our server is alive, and the
+        communications channel is open.  If we don't get a response
+        within a certain period, there will be... trouble.
         """
-        logging.info("%s Cli timeout %s" % (
-                self.name(), done and "done" or ""))
-        # Note that we've overridden the threading.Thread.name
-        # property in mincemeat.Potocol, so we need to call
-        # it directly in order to use it...
-        self.mincemeat.send_command(
-            "ping", ( "Client from %s" % ( socket.getfqdn()), 
-                      threading.Thread.name.__get__(
-                          threading.current_thread() )))
+        if not done:
+            self.mincemeat.ping( allowed=30.0)
 
 class Client_Repl(mincemeat.Client):
     """
     A mincemeat.Client that knows how to process the "transactiondone"
     response, containing the results of a previous "transaction"
-    command, sent by the Client to the Server.  
+    command, sent by the REPL vai the Client, to the Server.
     """
+    def __init__(self, *args, **kwargs):
+        mincemeat.Client.__init__(self, *args, **kwargs)
+        self.pingbeg = time.time()
+        self.pongtim = None             # time when pong received
+        self.pongtxn = None             # it's transaction
+
+    def ping(self, payload=None, now=None, allowed=None):
+        """
+        Send a ping command with a tell-tale time as the transaction
+        ID.  Allow a certain amount of delay before killing our
+        connection to the (crippled) server.
+
+        This method must be invoked (at least) often enough to ensure
+        that, under normal circumstances, the inter-ping latency, plus
+        any normal Server response delay, plus the round-trip trip
+        time does not exceed the allowed time.
+        """
+
+        # Check the last pong received.  Defaults to whenever we
+        # began.  If we exceed allowed, treat as a protocol failure
+        # (same as EOF).  Otherwise, send another ping.
+        now = time.time()
+        if self.pongtxn is not None:
+            delay, delaymsg = self.ping_delay(txn=self.pongtxn,
+                                              now=self.pongtim)
+            since, sincemsg = self.ping_delay(txn=self.pongtxn,
+                                              now=now)
+        else:
+            delay = 0.0
+            delaymsg = "?"
+            since = now - self.pingbeg
+            sincemsg = "%.3f s (no replies received)" % since
+
+        if since > allowed:
+            logging.warning("%s ping latency %s, last %s; Exceeds %.3fs allowed; disconnecting!" % (
+                self.name(), delaymsg, sincemsg, allowed))
+            self.handle_close()
+        else:
+            logging.info("%s ping latency %s, last %s < %s" % (
+                self.name(), delaymsg, sincemsg, allowed))
+            mincemeat.Client.ping(self, now=now)
+
+    def pong(self, command, data, txn):
+        """
+        Override the default pong, to remember the transaction numbers
+        of the ping responses we receive, and the time we received them.
+        """
+        self.pongtim = time.time()
+        self.pongtxn = txn
+        mincemeat.Client.pong(self, command, data, txn)
+
     def unrecognized_command(self, command, data=None, txn=None):
         """
         Store the results; let the main thread detect and print new results.
@@ -297,6 +346,7 @@ class Svr(mincemeat.Server_daemon):
         us; it also runs all the Server's ServerChannel's; hence, we
         use send_command, send_command_backchannel not necessary.
         """
+        pass
         logging.info("%s Svr timeout %s" % (
                 self.name(), done and "done" or ""))
 
@@ -350,7 +400,7 @@ class Server_Repl(mincemeat.Server):
 
 
 
-def repl( cli ):
+def REPL( cli ):
     """
     Await input from client.  Since Windows (unbelievably) cannot
     await async I/O on both a socket and the console, we must use a
@@ -359,7 +409,7 @@ def repl( cli ):
     command = 0
     print "Which files?  eg. '*.txt<enter>'"
     while cli.is_alive():
-        print "GLOB> "
+        print "GLOB> ",
         try:    inp = sys.stdin.readline().rstrip()
         except: inp = None
         if inp:
@@ -389,8 +439,8 @@ def main():
         # may need to attempt creating a Client or a Server several
         # times.
         begun = time.clock()
-        limit = 5.0			# Wait for this time, total
-        cycle = 0.1			# Wait about this long per cycle
+        limit = 5.0                     # Wait for this time, total
+        cycle = 0.1                     # Wait about this long per cycle
         while time.clock() < begun + limit:
             if not cli:
                 # No client yet? Create one.  May sometimes throw
@@ -457,21 +507,14 @@ def main():
         # transmission) every second.  This means that, upon failure
         # to transmit
 
-        rpt = threading.Thread( target = repl, args=(cli,) )
+        rpt = threading.Thread( target = REPL, args=(cli,) )
         rpt.start()
 
         while cli.is_alive() and rpt.is_alive():
             clista = logchange( cli, clista )
             if svr:
                 svrsta = logchange( svr, svrsta )
-
-            cli.mincemeat.send_command_backchannel(
-                "ping", ( "Request from %s" % ( socket.getfqdn()),
-                          str( threading.current_thread().name )))
-
-            time.sleep( 5 )
-
-
+            time.sleep( 1 )
 
     except KeyboardInterrupt:
         logging.info("Manual shutdown requested")

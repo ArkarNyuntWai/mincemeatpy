@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from __future__ import with_statement
 
 ################################################################################
 # Copyright (c) 2010 Michael Fairley
@@ -52,7 +53,17 @@ DEFAULT_PORT = 11235
 
 # Choose the best high-resolution timer for the platform
 timer = timeit.default_timer
-    
+
+# Pre-2.6 threading.Thread didn't have is_alive, etc...  Set up some
+# aliases, so it looks more modern.
+if not hasattr(threading, 'current_thread'):
+    threading.current_thread = threading.currentThread
+if not hasattr(threading.Thread, 'is_alive'):
+    threading.Thread.is_alive = threading.Thread.isAlive
+if not hasattr(threading.Thread, 'name'):
+    threading.Thread.name = property(threading.Thread.getName,
+                                     threading.Thread.setName)
+
 def generator(func):
     """
     Takes a simple function with signature "func(k,[v,...])==>v" or
@@ -128,7 +139,7 @@ def process(timeout=None, map=None, schedule=None):
     """
     try:
         if map is None:
-            map = asyncore.socket_map		# Internal asyncore knowledg!
+            map = asyncore.socket_map           # Internal asyncore knowledg!
 
         beg = now = timer()
         dur = 0.0
@@ -146,9 +157,9 @@ def process(timeout=None, map=None, schedule=None):
                     try:
                         if now >= exp:
                             logging.info("%s expired; Firing %r" % (exp, fun))
-                            fun()		# Timer expired; fire fun()!
+                            fun()               # Timer expired; fire fun()!
                         else:
-                            break		# Timer in future; done.
+                            break               # Timer in future; done.
                     except Exception, e:
                         # A scheduled event failed; this isn't
                         # considered fatal, but may be of interest...
@@ -169,7 +180,7 @@ def process(timeout=None, map=None, schedule=None):
             # 'remains'; None means no timeout.
             dur = now - beg
             rem = []
-            if exp is not None:           	# A (finite) event awaits...
+            if exp is not None:                 # A (finite) event awaits...
                 rem.append(exp - now)
             if timeout is not None:             # A (finite) timeout defined...
                 rem.append(timeout - dur)
@@ -255,14 +266,14 @@ class threaded_async_chat(asynchat.async_chat):
                 try:
                     save_asm = asyncore.socket_map
                     asyncore.socket_map = map
-                    asyncat.async_chat.__init__(self, sock)
+                    asynchat.async_chat.__init__(self, sock)
                 finally:
                     asyncore.socket_map = save_asm
 
         self.send_lock = threading.Lock()
-        self.sending = False		# Is asyncore.loop sending data?
-        self.reading = False		# Is asyncore.loop reading data?
-        self.shutdown = False		# Have we already shut down?
+        self.sending = False            # Is asyncore.loop sending data?
+        self.reading = False            # Is asyncore.loop reading data?
+        self.shutdown = False           # Have we already shut down?
 
     def handle_read(self):
         """
@@ -469,9 +480,8 @@ class Protocol(threaded_async_chat):
         self.auth = None
         self.mid_command = False
         self.what = "Proto."
-        self.peer = True		# Name shows >peer i'face by default
-        self.locl = None		# Just like self.addr, 'til known
-        self.update_addresses()
+        self.peer = True                # Name shows >peer i'face by default
+        self.locl = None                # Just like self.addr, 'til known
 
     def name(self, what = None, peer = None):
         """
@@ -722,8 +732,8 @@ class Protocol(threaded_async_chat):
         hard close; and we'll schedule a handle_close for the future,
         to force cleanup, should the shutdown not flow an EOF through.
         """
-        if self.shuttout 			\
-             and self.schedule is not None	 \
+        if self.shuttout                        \
+             and self.schedule is not None       \
              and self.tidy_close():
             # We performed a tidy close!  Schedule a real close, in
             # case it doesn't flow through...
@@ -797,31 +807,74 @@ class Protocol(threaded_async_chat):
     #      After both ends of the channel have authenticated eachother, they may
     # then use these commands.
     # 
-    def respond_to_ping(self, command, data, txn):
+    def ping(self, message=None, payload=None, now=None):
         """
-        Ping.  By default, expectes a (message, payload) and just
-        returns a new message with the same payload.
+        Send a standard "ping", carrying the given payload, and 
+        a txn containing the current time.time().
+        """
+        if now is None:
+            now = time.time()
+        if message is None:
+            message = "from %s" % (socket.getfqdn())
+        if payload is None:
+            payload = self.name()
+        self.send_command("ping", (message, payload), txn="%.6f" % now)
+
+    def ping_delay(self, txn, now=None):
+        """
+        Compute the round-trip delay time of a ping, from its 'txn',
+        and the current time 'now'.  Returns a tuple with numeric and
+        string display versions.
+        """
+        if now is None:
+            now = time.time()
+        delay = 0                       # Defaults to (0, "?"), if -'ve, or
+        delaymsg = "?"                  #  if any exception prevents conversion
+        try:
+            delay = now - float(txn)
+            if 0.0 <= delay < 0.01:
+                delaymsg = "%.3f ms" % (delay * 1000)
+            elif 0.0 <= delay:
+                delaymsg = "%.3f s" % (delay)
+        except:
+            pass
+
+        return (delay, delaymsg)
+
+    def ping_payload(self, command, data, txn):
+        """
+        Decodes a standard "ping" (or "pong"), logs it, and return its
+        payload.
         """
         try:
             message, payload = data
         except TypeError:
             message = data
             payload = None
-        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
-        message = "Reply from %s" % socket.getfqdn()
-        
-        self.send_command("pong", (message, payload), txn)
+
+        (delay, delaymsg) = self.ping_delay(txn)
+
+        logging.info("%s %s %s(%s): txn=%s time=%s" % (
+            self.name(), command, message, repr.repr(payload),
+            txn, delaymsg))
+
+        return payload
+
+    def respond_to_ping(self, command, data, txn):
+        """
+        Ping handler.  By default, expectes a (message, payload) and
+        just returns a new message with the same payload and txn.
+        """
+        message = "from %s" % socket.getfqdn()
+        payload = self.ping_payload(command, data, txn)
+        self.send_command("pong", (message, payload), txn=txn)
 
     def pong(self, command, data, txn):
         """
-        Pong (response to Ping).
+        Pong handler (response to a Ping).  Just logs it, and ignores
+        the payload.
         """
-        try:
-            message, payload = data
-        except TypeError:
-            message = data
-            payload = None
-        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
+        self.ping_payload(command, data, txn)
 
     def process_command(self, command, data=None, txn=None):
         """
@@ -1159,11 +1212,11 @@ class Server(asyncore.dispatcher, object):
             asyncore.dispatcher.__init__(self, map=map)
 
         self.schedule = schedule
-        self.shuttout = shuttout	# If None, no shutdown timeout (just close)
+        self.shuttout = shuttout        # If None, no shutdown timeout (just close)
 
         self.taskmanager = None
         self.password = None
-        self.shutdown = False		# Termination indication to clients
+        self.shutdown = False           # Termination indication to clients
 
         self.mapfn = None
         self.collectfn = None
@@ -1279,8 +1332,8 @@ class Server(asyncore.dispatcher, object):
             # otherwise, it'll leave a busted entry in
             # asyncore.socket_map, which will prevent asyncore.loop()
             # from working correctly.
-            logging.error( "Server couldn't bind to %s" % str( ( interface, port ) ))
-            #logging.error(traceback.format_exc())
+            logging.warning( "Server couldn't bind to %s" % (
+                str((interface, port))))
             self.close()
             raise
 
@@ -1343,7 +1396,8 @@ class Server(asyncore.dispatcher, object):
             # ECONNABORTED might be thrown on *BSD (see issue 105). 
             # In Python 2.7+, this is handled (returns None).
             if err[0] != errno.ECONNABORTED:
-                logging.error(traceback.format_exc())
+                logging.warning("Unhandled socket error on accept: %s\n%s" % (
+                    err, traceback.format_exc()))
             return
         else:
             # sometimes addr == None instead of (ip, port) (see issue 104)
@@ -1573,25 +1627,25 @@ class TaskManager(object):
 
     """
     # Possible .state
-    IDLE	= 0		# Awaiting a datasource
-    START	= 1		# Ready to start; prep iterator, decide phase
-    MAPPING	= 2		# Performing Map phase of task
-    REDUCING	= 3		# Performing Reduce phase of task
-    FINISHING	= 4		# Performing Finish phase, preparing results
-    FINISHED	= 5		# Final results available; loop or quit
+    IDLE        = 0             # Awaiting a datasource
+    START       = 1             # Ready to start; prep iterator, decide phase
+    MAPPING     = 2             # Performing Map phase of task
+    REDUCING    = 3             # Performing Reduce phase of task
+    FINISHING   = 4             # Performing Finish phase, preparing results
+    FINISHED    = 5             # Final results available; loop or quit
 
     # Possible .tasks option
-    MAPREDUCE	= 0
-    MAPONLY	= 1		# Only perform the Map phase
-    REDUCEONLY	= 2		# Only perform the Reduce phase
+    MAPREDUCE   = 0
+    MAPONLY     = 1             # Only perform the Map phase
+    REDUCEONLY  = 2             # Only perform the Reduce phase
 
     # Possible .allocation option
-    CONTINUOUS	= 0		# Continuously allocate tasks to every channel
-    ONESHOT	= 1		# Only allocate a single Map/Reduce task to each
+    CONTINUOUS  = 0             # Continuously allocate tasks to every channel
+    ONESHOT     = 1             # Only allocate a single Map/Reduce task to each
 
     # Possible .cycle options
-    SINGLEUSE   = 0		# After finishing, close Server and 'disconnect' clients
-    PERMANENT   = 1		# Go idle 'til another Map/Reduce transaction starts
+    SINGLEUSE   = 0             # After finishing, close Server and 'disconnect' clients
+    PERMANENT   = 1             # Go idle 'til another Map/Reduce transaction starts
 
     txn = "0"
     def __init__(self, datasource, server,
@@ -1776,7 +1830,7 @@ class TaskManager(object):
         # every Map or Reduce response was associated with this
         # Transaction.
         if txn != self.txn:
-            logging.error("%s Map result Transaction mismatch: %s != %s" % (
+            logging.info("%s Map result Transaction mismatch: %s != %s" % (
                     self.server.name(), txn, self.txn ))
             return
         if not data[0] in self.working_maps:
@@ -1791,7 +1845,7 @@ class TaskManager(object):
     def reduce_done(self, data, txn):
         # Don't use the results if they've already been counted
         if txn != self.txn:
-            logging.error("%s Reduce result Transaction mismatch: %s != %s" % (
+            logging.info("%s Reduce result Transaction mismatch: %s != %s" % (
                     self.server.name(), txn, self.txn ))
             return
         if not data[0] in self.working_reduces:
@@ -1823,10 +1877,6 @@ class Mincemeat_daemon(threading.Thread):
         threading.Thread.__init__(self, target=self.process,
                                   args=args, kwargs=kwargs)
         self.daemon = True
-        if not hasattr(self, 'is_alive'):
-            # Pre-2.6 threading.Thread didn't have is_alive...
-            self.is_alive = self.isAlive
-
         self._state = "idle"
 
         # Instantiate the (NOT optional!) Client or Server class, and
@@ -1873,7 +1923,7 @@ class Mincemeat_daemon(threading.Thread):
                 self.timeout()
             self.timeout(done=True)
         except Exception, e:
-            logging.error("%s failed: %s" % (self.name(), e))
+            logging.info("%s failed: %s" % (self.name(), e))
             self._state = "failed: %s" % e
         else:
             # Normal exit; if finished(), assume success

@@ -251,12 +251,12 @@ def client( credentials ):
     
 if __name__ == '__main__':
     logging.basicConfig( level=logging.INFO )
-
+    
     try:
         logging.info( "Trying as client..." )
         client( addr_info )
         # If we get here, we succeeded in connecting and authenticating...
         logging.info( "Client terminating normally" )
     except:
-        logging.info( "Trying as server..." )
+        logging.info( "Client connection failed; Trying as server..." )
         server( addr_info )
