@@ -6,7 +6,7 @@ import repr
 import socket
 import asyncore
 
-'''
+"""
 example-sf-election	-- elects (self) as server, or become a client
 
     To run this test, simply start multiple instances of this script:
@@ -33,7 +33,7 @@ is not found.
 
 Alternatively, here is a iterable that returns the contents of a set of
 files designated by name (or a "glob" pattern match):
-'''
+"""
 
 class file_contents(object):
     def __init__(self, pattern ):

@@ -10,7 +10,7 @@ import threading
 import time
 import sys
 
-'''
+"""
 example-sf-masterless	-- elect a server, become a client, schedule requests
 
     To run this test, simply start an instances of this script:
@@ -23,7 +23,7 @@ to create a client.  Therefore, this test will actually create a
 server thread AND a client, and will complete on its own!  You may
 start other instances, to speed things up -- they will connect to the
 existing server, and will act as clients only...
-'''
+"""
 
 class file_contents(object):
     def __init__(self, pattern ):
@@ -238,11 +238,6 @@ def client(credentials, asynchronous=False, map=None):
     logging.debug( "  Client._map at startup: %s" % (
             repr.repr(c._map)))
     c.conn(asynchronous=asynchronous, **credentials)
-    if asynchronous is False:
-        # Client communications with Server done; either server completed
-        # success, or exited without completing our authentication.
-        if not c.authenticated():
-            raise Exception( "Client couldn't authenticate!" )
     return c
     
 def main_server_on_demand():

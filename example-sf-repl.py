@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 import mincemeat
+import collections
 import glob
 import logging
+import os
 import repr
 import socket
 import errno
@@ -9,18 +11,20 @@ import asyncore
 import threading
 import time
 import traceback
+import select
 import sys
 
 """
-example-sf-daemon	-- elect a server, become a client, issue requests
+example-sf-repl		-- Client reads/schedules requests; Spawns Server if needed
 
     To run this test, simply start an instances of this script:
 
-        python example-sf-daemon.py
+        python example-sf-repl.py
 
-Each client may schedule Map-Reduce  for the server, and receive
-the results of those tasks sometime in the future.  Of course, each
-client also receives map and reduce tasks from the server.
+Each client may schedule Map-Reduce transactions to the Server, and
+receive the results of those transactions sometime in the future.  Of
+course, each Client also receives map and reduce tasks from the
+Server.
 """
 
 class file_contents(object):
@@ -194,7 +198,7 @@ finishfn = sum_values
 # immediately with the final results upon completion.
 # 
 
-global_results = []
+global_results = collections.deque()
 
 def store_results(results):
     global_results.append( results )
@@ -228,7 +232,7 @@ credentials = {
     'interface':	'localhost',
     'port': 		mincemeat.DEFAULT_PORT,
 
-    'datasource': 	datasource,
+    'datasource': 	None,	# Causes TaskManager to stay idle
     'mapfn':		mapfn,
     'collectfn':	collectfn,
     'reducefn':		reducefn,
@@ -242,45 +246,144 @@ def logchange( who, previous ):
         logging.info("%s was %s; now %s" % ( who.name(), previous, current ))
     return current
     
-
-# Use the main service thread timeout facility to send commands; NOT
-# send_back_channel, as required for externally-initiated commands!
+# 
+# Deriving from mincemeat.Mincemeat_daemon
+# 
+#     Pass a 'timeout=#.#' to the constructor, and override the
+# timeout method; timeout wil be invoked by the daemon's service
+# thread at the specified interval.  To send commands; use
+# send_command, NOT send_command_backchannel as required for external
+# thread initiated commands!
+# 
 
 class Cli(mincemeat.Client_daemon):
 
     def timeout(self, done=False):
         """
-        The Client_thread's process (asyncore.loop) thread is invoking
-        us; use send_command, NOT send_command_backchannel.
+        The Client_daemon's process (asyncore.loop) thread is invoking
+        us; use send_command; send_command_backchannel not necessary.
         """
         logging.info("%s timeout %s" % (
                 self.name(), done and "done" or ""))
         self.mincemeat.send_command("ping", ( "Client Timeout from %s" % (
                                              socket.getfqdn()), 
-                                        "%s -- Client loop" % ( 
+                                        "%s" % ( 
                                              threading.current_thread().name )))
+class Client_Repl(mincemeat.Client):
+    """
+    A mincemeat.Client that knows how to process the "transactiondone"
+    response, containing the results of a previous "transaction"
+    command, sent by the Client to the Server.  
+    """
+    def unrecognized_command(self, command, data=None, txn=None):
+        """
+        Store the results; let the main thread detect and print new results.
+        """
+        if command == "transactiondone":
+            store_results( data )
+            return True
+
+        return False
 
 class Svr(mincemeat.Server_daemon):
 
     def timeout(self, done=False):
         """
-        The Server_thread's process (asyncore.loop) thread is invoking
+        The Server_daemon's process (asyncore.loop) thread is invoking
         us; it also runs all the Server's ServerChannel's; hence, we
-        use send_command, NOT send_command_backchannel.
+        use send_command, send_command_backchannel not necessary.
         """
         logging.info("%s timeout %s" % (
                 self.name(), done and "done" or ""))
+
+        self.mincemeat.taskmanager.channel_log(None, "")
         for chan in self.mincemeat.taskmanager.channels.keys():
-            chan.send_command("ping", ( "Server Timeout from %s" % (
-                                             socket.getfqdn()), 
-                                        "%s -- Server loop" % ( 
-                                             threading.current_thread().name )))
+            self.mincemeat.taskmanager.channel_log(chan, "")
+
+            #chan.send_command("ping", ( "Server Timeout from %s" % (
+            #                                 socket.getfqdn()), 
+            #                            "%s" % ( 
+            #                                 threading.current_thread().name )))
+
+
+class Server_Repl(mincemeat.Server):
+    """
+    A mincemeat.Server that knows how to process the "transaction"
+    command issued by a Client, coming in via our ServerChannel to
+    that client.
+
+    We'll enqueue deque of tasks, where we'll remember the issuing
+    ServerChannel, and the (command, data, txn) tuple.  Later, after
+    the transaction is complete, we'll send back a "transactiondone".
+    
+    """
+
+    def unrecognized_command(self, command, data=None, txn=None, chan=None):
+        """
+        Schedule a future Map/Reduce transaction.  The Client's 'txn'
+        will be used when sending back the results in the
+        corresponding "transactiondone" response.  
+
+        The local Map/Reduce transaction performed by our TaskManager
+        will generate its own 'txn', independent of this one created
+        by the Client.
+        """
+        logging.info("%s received command via %s from peer %s: %s %s" % (
+                self.name(), chan.name(), str(chan.addr), 
+                '/'.join( [command] + ( txn and [txn] or [])), repr.repr(data)))
+
+        if command == "transaction":
+            path = os.path.join( "../Gutenberg SF CD/Gutenberg SF",
+                                 str(data))
+            logging.info("%s Map/Reduce Transaction: %s" % (
+                    self.name, path))
+            self.datasource = file_contents( path )
+
+            #self.datasource = transactions.append( (command, data, txn, chan) )
+            return True
+
+        return False
+
+    def resultfn(self, results, txn):
+        """
+        Trap the result, and send them back.
+        """
+        logging.info("%s computed results: %s" (repr.repr( results )))
+
+
+
+def repl( cli ):
+    """
+    Await input from client.  Since Windows (unbelievably) cannot
+    await async I/O on both a socket and the console, we must use a
+    separate thread...  A blank line will terminate input.
+    """
+    command = 0
+    print "Which files?  eg. '*.txt<enter>'"
+    while cli.is_alive():
+        print "GLOB> "
+        try:    inp = sys.stdin.readline().rstrip()
+        except: inp = None
+        if inp:
+            cli.mincemeat.send_command_backchannel( "transaction", inp,
+                                                    txn = str( command ))
+        else:
+            break
+        command += 1
+
+        while cli.is_alive() and not global_results:
+            print ".",
+            time.sleep( 1 )
+        if global_results:
+            server_results( global_results.popleft() )
+    
 
 def main():
     cli = None
     clista = "(none)"
     svr = None
     svrsta = "(none)"
+    rpt = None
     try:
         # If we fail to start a Client, try firing up a Server while
         # continuing trying to fire up the Client.  Since we don't
@@ -296,7 +399,7 @@ def main():
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = Cli(credentials, timeout=5.0)
+                    cli = Cli(credentials, cls=Client_Repl, timeout=5.0)
                     clista = logchange( cli, clista )
                     cli.start()
                     clista = logchange( cli, clista )
@@ -321,16 +424,17 @@ def main():
 
             if not svr:
                 # Client didn't come up and/or didn't immediately
-                # authenticate.  Create a Server.
+                # authenticate.  Create a Server_Repl.
                 try:
-                    svr = Svr(credentials, timeout=5.0)
+                    svr = Svr(credentials, cls=Server_Repl, timeout=5.0)
                     svrsta = logchange( svr, svrsta )
                     svr.start()
                     svrsta = logchange( svr, svrsta )
                 except Exception, e:
                     # The bind probably failed; Server couldn't
                     # bind,...  Perhaps someone else beat us to it!
-                    logging.warning("Server thread failed: %s" % e)
+                    logging.warning("Server thread failed: %s\n%s" % (
+                            e, traceback.format_exc()))
 
             if svr:
                 svrsta = logchange( svr, svrsta )
@@ -347,35 +451,37 @@ def main():
         # callback to deliver the results.
 
         if not cli or cli.state() != "authenticated":
-            logging.error("Client couldn't authenticate with Server")
-        else:
-            # Got an authenticated Client (and either a Server
-            # existed, or we spawned one.  Process 'til the client
-            # thread is done.  Send pings (with no timeout on
-            # transmission) every second.  This means that, upon failure to 
-            # transmit
-            while cli.is_alive():
-                clista = logchange( cli, clista )
-                if svr:
-                    svrsta = logchange( svr, svrsta )
-                begun = time.clock()
-                cli.mincemeat.send_command_backchannel(
-                    "ping", ( "Request from %s" % ( socket.getfqdn()),
-                               #'x' * 1 * 1000 * 1000 ))	# a big blob...
-                              "%s -- main thread" % (		# a thread name
-                                  threading.current_thread().name )))
-                time.sleep( 5 )
+            raise Exception("Client couldn't authenticate with Server")
 
-            # Done! Client has exited.  Log any results available, if
-            # we were running Server
-            while global_results:
-                server_results( global_results[0] )
-                del global_results[0]
+        # Got an authenticated Client (and either a Server existed, or
+        # we spawned one.  Start the REPL, and process 'til the client
+        # thread is done.  Send pings (with no timeout on
+        # transmission) every second.  This means that, upon failure
+        # to transmit
+
+        rpt = threading.Thread( target = repl, args=(cli,) )
+        rpt.start()
+
+        while cli.is_alive() and rpt.is_alive():
+            clista = logchange( cli, clista )
+            if svr:
+                svrsta = logchange( svr, svrsta )
+
+            cli.mincemeat.send_command_backchannel(
+                "ping", ( "Request from %s" % ( socket.getfqdn()),
+                          #'x' * 1 * 1000 * 1000 ))		# a big blob, or
+                          "%s" % threading.current_thread().name ))
+                          #req ))				# client request
+
+            time.sleep( 5 )
+
 
 
     except KeyboardInterrupt:
         logging.info("Manual shutdown requested")
-
+    except Exception, e:
+        logging.error("Exception encountered: %s\n%s" % (
+                e, traceback.format_exc()))
     finally:
         # Exception, Manual shutdown (eg. KeyboardInterrupt), or
         # normal exit; stop any Client and/or Server.  This will cause
@@ -384,6 +490,9 @@ def main():
             svr.stop()
         if cli:
             cli.stop()
+        if rpt:
+            sys.stdin.close()
+            rpt.join()
 
     # Ensure that everything exited cleanly.  The Server should be
     # done, and should have finished() and produced results().
@@ -397,6 +506,6 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.DEBUG )
+    logging.basicConfig( level=logging.INFO )
     sys.exit(main())
 

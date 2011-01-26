@@ -468,62 +468,97 @@ class Protocol(threaded_async_chat):
         self.buffer = []
         self.auth = None
         self.mid_command = False
-        self.what = ""
-        self.locl = (None, None)
-        self.name("Protocol")
+        self.what = "Proto."
+        self.peer = True		# Name shows >peer i'face by default
+        self.locl = None		# Just like self.addr, 'til known
+        self.update_addresses()
 
-    def name(self, what = None):
+    def name(self, what = None, peer = None):
         """
         Some human-readable name for this Protocol endpoint, including
-        the local interface, port:
+        the either the local i'face:port, or the destination i'face:port:
         
-            name@iface:port
+            name@locl:port
+            name>addr:port
 
-        Only updates self.what if non-empty what is provided, and also
-        updates empty self.locl if connected.
+        Normally, if a protocol endpoint is the accepting end, it will
+        have a locl i'face:port at a well-known (and boring) address,
+        and we'll generally want to show the peer's (ephemeral)
+        address.  So, default to show peer, unless we find we're on
+        the connect path (below).  Regardless, show the address we
+        have (if any).
+        
+        Only updates self.what, .dest if non-empty what or dest is
+        provided, and also updates empty self.locl if connected.
         """
         if what is not None:
             self.what = what
-        if self.connected and self.locl[0] is None:
-            try:    self.locl = self.socket.getsockname()
-            except: pass
-        return self.what + '@' + str(self.locl[0]) + ':' + str(self.locl[1] )
+        if peer is not None:
+            self.peer = peer
+        if self.peer and self.addr or not self.locl:
+            char = '>'
+            addr = self.addr and self.addr or (None, None)
+        else:
+            char = '@'
+            addr = self.locl and self.locl or (None, None)
+
+        return self.what + char + str(addr[0]) + ':' + str(addr[1])
+
+    def update_addresses(self):
+        try:
+            addr = self.socket.getpeername()
+            if self.addr is None:
+                self.addr = addr
+            elif self.addr != addr:
+                logging.info("%s resolved peer address %s to %s" % (
+                        self.name(), str(self.addr), str(addr)))
+                self.addr = addr
+        except Exception, e:
+            logging.info( "Couldn't update peer address: %s" % e )
+            pass
+
+        try:
+            locl = self.socket.getsockname()
+            if self.locl is None or self.locl != locl:
+                logging.info("%s resolved locl address %s to %s" % (
+                        self.name(), str(self.locl), str(locl)))
+                self.locl = locl
+        except Exception, e:
+            logging.info( "Couldn't update locl address: %s" % e )
+            pass
 
     def connect(self, addr):
         """
         Initiate a connect, setting self.addr to a (tentative)
         address, in case if the underlying asyncore.dispatcher.connect
-        doesn't; on some platforms, this is unreliable.
+        doesn't; on some platforms (guess...), this is unreliable.
+
+        The accept and connect paths are the two general ways a socket
+        establishes endpoint addresses; on the connect path, we don't
+        know the actual .addr (peer addr) and .locl (local ephemeral
+        addr), 'til the connect completes.  Since we are on the
+        connect path, default to showing the local i'face in our name.
         """
         if self.addr is None:
             self.addr = addr
+        self.name(peer=False)
         logging.info( "%s connecting to %s" % ( self.name(), addr ))
         threaded_async_chat.connect(self, addr)
 
     def handle_connect(self):
         """
-        A connect has completed! We need to detect the local interface
-        address; this is a side-effect of self.name(), if it is not
-        already known.
+        A connect has completed!  We probably need to detect the local
+        interface address...
         """
-        self.name()
-        try:
-            addr = self.socket.getpeername()
-            if self.addr is None:
-                self.addr = addr
-            elif self.addr[0] != addr[0]:
-                logging.info("%s resolved peer name %s to %s" % (
-                        self.name(), self.addr[0], addr[0] ))
-                self.addr[0] = addr[0]
-        except:
-            pass
-        logging.info("%s connection established to %s" % (
-                self.name(), str(self.addr)))
+        self.update_addresses()
+        logging.info("%s connection established %s->%s" % (
+                self.name(),
+                str(self.locl), str(self.addr)))
 
     def authenticated(self):
         return self.auth == "Done"
 
-    def send_command(self, command, data=None):
+    def send_command(self, command, data=None, txn=None):
         """
         Allows the asyncore.loop thread OR an external thread to
         compose and send a command, pushing it onto the async_chat
@@ -548,7 +583,18 @@ class Protocol(threaded_async_chat):
         NOT know that output is now ready for sending; until it
         awakens, the external thread must ensure that the data gets
         sent, using flush_backchannel.
+
+        The command may or may not contain an optional transaction; we
+        append it, if supplied.  If an (optional) data segment is
+        supplied, its length follows the mandatory ':'
+
+            <command>[/<transaction>]:[length]\n
+            [data\n]
         """
+        if txn:
+            if "/" in command:
+                raise SyntaxError("Command already contains transaction id!")
+            command += "/" + str(txn)
         if not ":" in command:
             command += ":"
         if data:
@@ -560,7 +606,7 @@ class Protocol(threaded_async_chat):
             logging.debug( "%s -->%s" % (self.name(), command))
             self.push(command + "\n")
 
-    def send_command_backchannel(self, command, data=None, timeout=None):
+    def send_command_backchannel(self, command, data=None, txn=None, timeout=None):
         """
         Allows another thread (NOT the asyncore.loop) to compose and
         send a command.  If the asyncore.loop thread knows that there
@@ -578,7 +624,7 @@ class Protocol(threaded_async_chat):
         writable()), or asyncore.loop discovers this fact!
         """
         now = timer()
-        self.send_command(command, data)
+        self.send_command(command, data, txn)
         self.flush_backchannel(now=now, timeout=timeout)
 
     # ----------------------------------------------------------------------
@@ -610,7 +656,11 @@ class Protocol(threaded_async_chat):
 
         Authenticated commands:
             challenge:<arbitrary data>\n
-            <command>:length\n<length bytes of data>
+            <command>[/<transaction>]:\n
+            <command>[/<transaction>]:length\n<length bytes of data>
+
+          Transaction IDs may be appended to a command, and are passed
+          unmollested in the 'txn=' keyword arg process_command.
         """
         merged = ''.join(self.buffer)
         if not self.authenticated():
@@ -621,13 +671,21 @@ class Protocol(threaded_async_chat):
             logging.debug("%s<-- %s" % (self.name(), merged))
             command, length = merged.split(":", 1)
             if command == "challenge":
+                # length is actually arbitrary data, in this case
                 self.process_command(command, length)
             elif length:
+                # Continue reading the command's data segment
                 self.set_terminator(int(length))
                 self.mid_command = command
             else:
-                self.process_command(command)
-        else: # Read the data segment from the previous command
+                # Command with no data; still may have txn ID
+                txn = command.find('/')
+                if txn >= 0:
+                    self.process_command(command[0:txn], txn=command[txn+1:])
+                else:
+                    self.process_command(command)
+        else:
+            # Read the data segment from the previous command
             if not self.authenticated():
                 logging.fatal("Recieved pickled data from unauthed source")
                 # sys.exit(1)
@@ -637,7 +695,11 @@ class Protocol(threaded_async_chat):
             self.set_terminator("\n")
             command = self.mid_command
             self.mid_command = None
-            self.process_command(command, data)
+            txn = command.find('/')
+            if txn >= 0:
+                self.process_command(command[0:txn], data, txn=command[txn+1:])
+            else:
+                self.process_command(command, data)
         self.buffer = []
 
     def handle_close(self):
@@ -691,14 +753,17 @@ class Protocol(threaded_async_chat):
     # Un-authenticated commands
     # 
     #     The un-authenticated portion of the protocol, used to
-    # implement challenge-response authentication
+    # implement challenge-response authentication.  Note that
+    # respond_to_challenge may actually be either an authenticated OR
+    # an un-authenticated commadn (depending on who demanded auth
+    # first).
     # 
     def send_challenge(self):
         logging.debug("%s -- send_challenge" % self.name())
         self.auth = os.urandom(20).encode("hex")
         self.send_command(":".join(["challenge", self.auth]))
 
-    def respond_to_challenge(self, command, data):
+    def respond_to_challenge(self, command, data, txn=None):
         logging.debug("%s -- respond_to_challenge" % self.name())
         mac = hmac.new(self.password, data, hashlib.sha1)
         self.send_command(":".join(["auth", mac.digest().encode("hex")]))
@@ -711,52 +776,6 @@ class Protocol(threaded_async_chat):
             self.auth = "Done"
             logging.info("%s Authenticated other end" % self.name())
         else:
-            self.handle_close()
-
-    # -------------------------------------------------------------------------
-    # Authenticated commands
-    # 
-    #      After both ends of the channel have authenticated eachother, they may
-    # then use these commands.
-    # 
-    # 
-    def respond_to_ping(self, command, data):
-        """
-        Ping.  By default, expectes a (message, payload) and just
-        returns a new message with the same payload.
-        """
-        try:
-            message, payload = data
-        except TypeError:
-            message = data
-            payload = None
-        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
-        message = "Reply from %s" % socket.getfqdn()
-        self.send_command("pong", (message, payload))
-
-    def pong(self, command, data):
-        """
-        Pong (response to Ping).
-        """
-        try:
-            message, payload = data
-        except TypeError:
-            message = data
-            payload = None
-        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
-
-    def process_command(self, command, data=None):
-        commands = {
-            'ping': self.respond_to_ping,
-            'pong': self.pong,
-            'challenge': self.respond_to_challenge,
-            'disconnect': lambda x, y: self.handle_close(),
-            }
-
-        if command in commands:
-            commands[command](command, data)
-        else:
-            logging.critical("Unknown command received: %s" % (command,)) 
             self.handle_close()
 
     def process_unauthed_command(self, command, data=None):
@@ -772,6 +791,81 @@ class Protocol(threaded_async_chat):
             logging.critical("Unknown unauthed command received: %s" % (command,)) 
             self.handle_close()
         
+    # -------------------------------------------------------------------------
+    # Authenticated commands
+    # 
+    #      After both ends of the channel have authenticated eachother, they may
+    # then use these commands.
+    # 
+    def respond_to_ping(self, command, data, txn):
+        """
+        Ping.  By default, expectes a (message, payload) and just
+        returns a new message with the same payload.
+        """
+        try:
+            message, payload = data
+        except TypeError:
+            message = data
+            payload = None
+        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
+        message = "Reply from %s" % socket.getfqdn()
+        
+        self.send_command("pong", (message, payload), txn)
+
+    def pong(self, command, data, txn):
+        """
+        Pong (response to Ping).
+        """
+        try:
+            message, payload = data
+        except TypeError:
+            message = data
+            payload = None
+        logging.info("%s %s:%s" % (self.name(), command, repr.repr((message, payload))))
+
+    def process_command(self, command, data=None, txn=None):
+        """
+        Process a command, if possible; returns True iff handled.
+        """
+        commands = {
+            'ping': self.respond_to_ping,
+            'pong': self.pong,
+            'challenge': self.respond_to_challenge,
+            'disconnect': lambda x, y: self.handle_close(),
+            }
+
+        if command in commands:
+            commands[command](command, data, txn)
+            return True
+
+        if self.unrecognized_command( command, data, txn):
+            return True
+
+        self.failed_command( command, data, txn)
+        return False
+
+    def unrecognized_command(self, command, data=None, txn=None):
+        """
+        Override in derived classes, to do something with incoming
+        commands unknown to Protocol or derived classes.  Default
+        behavior is to deem such commands a fatal protocol failure,
+        and kill the connection.
+
+        Return True iff the command is handled.
+        """
+        return False
+
+    def failed_command(self, command, data=None, txn=None):
+        """
+        Default behavior is to deem such commands a fatal protocol
+        failure, and kill the connection.
+
+        Return True iff the command is handled.
+        """
+        logging.critical("Unknown command received: %s (txn: %s)" % (
+                command, txn))
+        self.handle_close()        
+
     # -------------------------------------------------------------------------
     # function marshalling utilities
     # 
@@ -823,8 +917,9 @@ class Protocol(threaded_async_chat):
 
 class Client(Protocol):
     """
-    Connect's to a specified server:port, and processes commands
-    (authentication is handled by the Protocol superclass).
+    Implements a mincemeat Map/Reduce Client.  Connect's to a
+    specified server:port, and processes commands (authentication is
+    handled by the Protocol superclass).
     """
     def __init__(self, map=None, schedule=None, shuttout=None):
         """
@@ -837,13 +932,16 @@ class Client(Protocol):
     def finished(self):
         return self.shutdown is True
 
-    def conn(self, interface='', port=DEFAULT_PORT, password=None,
-             asynchronous=False):
+    def conn(self, interface="", port=DEFAULT_PORT, password=None,
+             asynchronous=False, **kwargs):
         """
-        Establish connection, and (optionally) synchronously loop 'til
-        all file descriptors closed.  Optionally specifies password.
-        Note that order is different than Server.run_server, for
-        historical reasons.
+        Establish Client connection, and (optionally) synchronously
+        loop 'til all file descriptors closed.  Optionally specifies
+        password.  Note that order is different than
+        Server.run_server, for historical reasons.  Ignores additional
+        unrecognized keyward args, so that identical packages of
+        configuration may be used for both a Client.conn and a
+        Server.conn call.
         
         If no server port exists to bind to, on Windows the
         select.select() call will return an "exceptional" condition on
@@ -861,6 +959,9 @@ class Client(Protocol):
         Since the default kernel socket behavior for interface == ""
         is inconsistent, we'll choose "localhost".
         """
+        for k, v in kwargs.iteritems():
+            logging.info("%s conn ignores %s = %s" % (
+                    self.name(), k, v))
         if password is not None:
             self.password = password
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -886,16 +987,16 @@ class Client(Protocol):
         """
         return process(timeout=timeout, map=self._map, schedule=self.schedule)
 
-    def set_mapfn(self, command, mapfn):
+    def set_mapfn(self, command, mapfn, txn):
         self.mapfn = self.load_func(mapfn, globals())
 
-    def set_collectfn(self, command, collectfn):
+    def set_collectfn(self, command, collectfn, txn):
         self.collectfn = self.load_func(collectfn, globals())
 
-    def set_reducefn(self, command, reducefn):
+    def set_reducefn(self, command, reducefn, txn):
         self.reducefn = self.load_func(reducefn, globals())
 
-    def call_mapfn(self, command, data):
+    def call_mapfn(self, command, data, txn):
         """
         Map the data.  In the Map phase, the data is always a
         (name,corpus) pair, and the result of the mapfn is always a
@@ -918,6 +1019,8 @@ class Client(Protocol):
         handle either simple functions operating on each individual
         (key,[value,...])  item, or generators which operate over the
         sequence of all items (and hence may employ remembered state).
+
+        Note that if command contains a 
         """
         logging.info("%s Mapping %s" % (self.name(), repr.repr(data[0])))
         results = {}
@@ -937,9 +1040,9 @@ class Client(Protocol):
             # (eg. discarding invalid keys, adding new keys).
             results = dict((k, [v]) for k, v in rgen)
 
-        self.send_command('mapdone', (data[0], results))
+        self.send_command('mapdone', (data[0], results), txn)
 
-    def call_reducefn(self, command, data):
+    def call_reducefn(self, command, data, txn=None):
         """
         Reduce the data.  In the Reduce phase, the data is always a
         (key,[value,...]) item (ie. one of the results returned from
@@ -964,9 +1067,9 @@ class Client(Protocol):
         results = list(rgen)
         if len(results) != 1:
             raise IndexError
-        self.send_command('reducedone', results[0])
+        self.send_command('reducedone', results[0], txn)
         
-    def process_command(self, command, data=None):
+    def process_command(self, command, data=None, txn=None):
         commands = {
             'mapfn': self.set_mapfn,
             'collectfn': self.set_collectfn,
@@ -976,9 +1079,10 @@ class Client(Protocol):
             }
 
         if command in commands:
-            commands[command](command, data)
-        else:
-            Protocol.process_command(self, command, data)
+            commands[command](command, data, txn)
+            return True
+
+        return Protocol.process_command(self, command, data, txn)
 
     def post_auth_init(self):
         """
@@ -1057,19 +1161,19 @@ class Server(asyncore.dispatcher, object):
         self.schedule = schedule
         self.shuttout = shuttout	# If None, no shutdown timeout (just close)
 
+        self.taskmanager = None
+        self.password = None
+        self.shutdown = False		# Termination indication to clients
+
         self.mapfn = None
         self.collectfn = None
         self.reducefn = None
         self.finishfn = None
         self.resultfn = None
-        self.datasource = None
-        self.password = None
-        self.taskmanager = None
-        self.shutdown = False		# Termination indication to clients
 
 
     # -------------------------------------------------------------------------
-    # Methods required by mincemeat_daemon
+    # Methods required by Mincemeat_daemon
 
     def authenticated(self):
         """
@@ -1078,12 +1182,21 @@ class Server(asyncore.dispatcher, object):
         return False
 
     def name(self):
-        return "Server" + '@' + str(self.addr[0]) + ':' + str(self.addr[1])
+        """
+        Our name is simply the bind address, which is saved (oddly) in
+        addr; this means that asyncore.dispatcher treats self.addr as
+        a remote peer interface address (when used with connect, and
+        after creating a dispatcher following accept), but as a local
+        interface address when used with bind/lishten.  It will be
+        None 'til bind is invoked.
+        """
+        addr = self.addr and self.addr or (None,None)
+        return "Server" + '@' + str(addr[0]) + ':' + str(addr[1])
 
     def log_info(self, message, type):
         getattr(logging,type)(message)
         
-    def run_server(self, password="", port=DEFAULT_PORT, interface='',
+    def run_server(self, password="", port=DEFAULT_PORT, interface="",
                    asynchronous=False):
         """
         Runs the Server.  Use this method in the default asynchronous
@@ -1114,7 +1227,7 @@ class Server(asyncore.dispatcher, object):
         asyncore.loop() call will return instantly, and the Thread
         will terminate...
         """
-        self.conn( password=password, port=port, interface=interface,
+        self.conn(password=password, port=port, interface=interface,
                    asynchronous=asynchronous)
 
         # If we are asynchronous, we have NOT initiated processing;
@@ -1122,12 +1235,14 @@ class Server(asyncore.dispatcher, object):
         # we are were not asynchronous.
         return self.results()
 
-    def conn(self, password="", port=DEFAULT_PORT, interface='',
-              asynchronous=False):
+    def conn(self, password="", port=DEFAULT_PORT, interface="",
+             asynchronous=False, **kwargs):
         """
         Establish this Server, allowing Clients to connect to it.
         This will allow exactly one Server bound to a specific port to
-        accept incoming Client connections.
+        accept incoming Client connections.  Any additional keyword
+        args are assumed to be (optional) values for Server attributes
+        (eg. .datasource, .mapfn, ...)
 
         If asynchronous, then we will not initiate processing; it is
         the caller's responsibility to do so; every Client and/or
@@ -1137,6 +1252,16 @@ class Server(asyncore.dispatcher, object):
         The default behaviour of bind when interface == '' is pretty
         consistently to bind to all available interfaces.
         """
+        for k, v in kwargs.iteritems():
+            if hasattr(self,k):
+                if getattr(self,k) is None:
+                    logging.info("%s conn setting %s = %s" % (self.name(), k, v))
+                else:
+                    logging.info("%s conn setting %s = %s (was %s)" % (
+                            self.name(), k, v, getattr(self, k)))
+                setattr(self, k, v)
+            else:
+                logging.debug("%s conn ignores %s = %s" % (self.name(), k, v))
         self.password = password
         logging.debug("Server port opening.")
         try:
@@ -1201,15 +1326,22 @@ class Server(asyncore.dispatcher, object):
         server's taskmanager.  We'll use the TaskManager to monitor
         the pool of available channels.  Ensure we handle accept()
         error cases (see http://bugs.python.org/issue6706)
+        
+        We simply ignore incomplete connection attempts; logging would
+        present an increased DOS attack opportunity.  It may make
+        sense to minimize or eliminate logging 'til authentication of
+        client is complete, if used in an internet-facing application.
         """
         try:
             sock, addr = self.accept()
         except TypeError:
             # sometimes accept() might return None (see issue 91)
-            # In Python 2.7+
+            # In Python 2.7+, asyncore.dispatcher.accept is improved,
+            # but may still return just None.
             return
         except socket.error, err:
-            # ECONNABORTED might be thrown on *BSD (see issue 105)
+            # ECONNABORTED might be thrown on *BSD (see issue 105). 
+            # In Python 2.7+, this is handled (returns None).
             if err[0] != errno.ECONNABORTED:
                 logging.error(traceback.format_exc())
             return
@@ -1218,6 +1350,7 @@ class Server(asyncore.dispatcher, object):
             if addr == None:
                 return
 
+        # Got a valid socket and address; spawn a ServerChannel to handle.
         sc = ServerChannel(sock, addr, self)
         sc.password = self.password
 
@@ -1252,13 +1385,47 @@ class Server(asyncore.dispatcher, object):
         self.handle_close()
 
     def set_datasource(self, ds):
-        self._datasource = ds
-        self.taskmanager = TaskManager(self._datasource, self)
+        """
+        Setting a new datasource replaces the TaskManager.  This must
+        be done only when no Map/Reduce tasks are outstanding, because
+        the incoming responses will be supplied to the Server's
+        current TaskManager.  Unfortunately, it it is almost
+        impossible to ensure; communications to a client may be
+        nondeterministically delayed, so ancient responses may arrive
+        at any time.
+        """
+        # Create a TaskManager, or give an idle one the datasource
+        if self.taskmanager is None:
+            self.taskmanager = TaskManager(ds, self)
+        else:
+            if self.taskmanager.state != TaskManager.IDLE:
+                raise Exception("TaskManager Busy")
+            self.taskmanager.datasource = ds
+
+        # If a non-None datasource provided, START the IDLE
+        # TaskManager, and jump-start any idling channels.
+        if ds is not None:
+            if self.taskmanager.state is TaskManager.IDLE:
+                self.taskmanager.state = TaskManager.START
+                for chan, activity in self.taskmanager.channels.iteritems():
+                    if activity is None:
+                        chan.start_new_task()
     
     def get_datasource(self):
-        return self._datasource
+        return self.taskmanager and self.taskmanager.datasource or None
 
     datasource = property(get_datasource, set_datasource)
+
+    def unrecognized_command(self, command, data=None, txn=None, chan=None):
+        """
+        Process a command, if possible, from the specified
+        ServerChannel; returns True iff handled.  We will get all
+        unrecognized commands received by our ServerChannels.  If we
+        don't recognize them, we just return False to elicit the
+        default behavior (protocol failure; close channel.)
+        """
+        return False
+
 
 
 class ServerChannel(Protocol):
@@ -1273,13 +1440,21 @@ class ServerChannel(Protocol):
     The default behaviour for using a client is to:
     A) authenticate
     B) Process tasks, by
-    C)   getting one from the TaskManager (going idle if None)
+    C)   getting one from the TaskManager.start_new_task (going idle if None)
     D)   sending it to the client
     E) When a 'mapdone' or 'reducedone' is received, go to B
     F) If EOF encountered, close session
 
     If a channel goes idle, invoke channel.start_new_task() to start
     it up, by force it to go get a new task.
+
+    Normally, Map/Reduce Task commands flow from the Server's
+    TaskManager by the process above.  However, arbitrary commands may
+    flow in the opposite direction: from the Client, to the
+    ServerChannel (handled by overridden process_command or
+    unrecognized command methods).  Similarly, other commands may be
+    sent (from the Server, for example) via our send_command and
+    send_command_backchannel methods.
     """
     def __init__(self, sock, addr, server):
         # We need to use the same asyncore _map as the server.
@@ -1301,41 +1476,57 @@ class ServerChannel(Protocol):
         logging.debug("%s -- start_auth" % self.name())
         self.send_challenge()
 
+    # We use these ...taskmanager.channel_...() methods to maintain
+    # channel state in the taskmanager, ONLY for Map/Reduce task
+    # commands we issue and the corresponding responses we receive.
+    # Any other commands sent/received via the ServerChannel do not
+    # affect the taskmanager state.  This allows the taskmanager to
+    # use its channel_... state to determine how the ServerChannel
+    # needs to be prodded, as a Map/Reduce Transaction proceeds.
     def start_new_task(self):
         if self.server.shutdown:
             self.tidy_close()
             return
-        command, data = self.server.taskmanager.next_task(self)
+        command, data, txn = self.server.taskmanager.next_task(self)
         if command == None:
-            logging.info("%s idle to peer %s" % (
-                    str(self.addr)))
+            self.server.taskmanager.channel_idle(self)
+            logging.info("%s idle" % self.name())
             return
-        self.send_command(command, data)
+        self.server.taskmanager.channel_sending(self, command, txn)
+        self.send_command(command, data, txn)
 
-    def map_done(self, command, data):
-        self.server.taskmanager.map_done(data)
+    def map_done(self, command, data, txn):
+        self.server.taskmanager.channel_process(self, command, txn)
+        self.server.taskmanager.map_done(data, txn)
         self.start_new_task()
 
-    def reduce_done(self, command, data):
-        self.server.taskmanager.reduce_done(data)
+    def reduce_done(self, command, data, txn):
+        self.server.taskmanager.channel_process(self, command, txn)
+        self.server.taskmanager.reduce_done(data, txn)
         self.start_new_task()
 
-    def send_command(self, command, data = None):
-        self.server.taskmanager.channel_sending(self, command)
-        Protocol.send_command(self, command, data)
-
-    def process_command(self, command, data=None):
+    def process_command(self, command, data=None, txn=None):
         commands = {
             'mapdone': self.map_done,
             'reducedone': self.reduce_done,
             }
 
-        self.server.taskmanager.channel_process(self, command)
-        
         if command in commands:
-            commands[command](command, data)
-        else:
-            Protocol.process_command(self, command, data)
+            commands[command](command, data, txn)
+            return True
+
+        return Protocol.process_command(self, command, data, txn)
+
+    def unrecognized_command(self, command, data=None, txn=None):
+        """
+        Direct all other unknown incoming commands to the Server.  If
+        it doesn't like 'em, we're toast; consider it a protocol
+        failure (by invoking original base class method).
+        """
+        if self.server.unrecognized_command( command, data, txn, chan=self):
+            return True
+
+        return Protocol.unrecognized_command(self, command, data, txn)
 
     def post_auth_init(self):
         """
@@ -1347,7 +1538,6 @@ class ServerChannel(Protocol):
 
         We assume that the Client is going to like our response, so we
         can proceed to transmit configuration to the client.
-        
         """
         logging.debug("%s -- post_auth_init" % self.name())
         if self.server.mapfn:
@@ -1362,7 +1552,7 @@ class ServerChannel(Protocol):
 class TaskManager(object):
     """
     Produce a stream of Map/Reduce tasks for all requesting
-    ServerChannel channels. 
+    ServerChannel channels.  
 
     Normally, the default TaskManager .tasks is MAPREDUCE, and
     .allocation to CONTINUOUS, meaning that each channel will receive
@@ -1371,23 +1561,24 @@ class TaskManager(object):
     
     After all available 'map' tasks have been assigned to a client,
     any 'map' tasks not yet reported as complete will be
-    (duplicately!) re-assigned to the next Client who asks.  This
-    takes care of stalled or failed clients.
+    (duplicately!) re-assigned to the next client channel that asks.
+    This takes care of stalled or failed clients.
 
     When all 'map' tasks have been reported as completed (any
     duplicate responses are ignored), then the 'reduce' tasks are
-    assigned to the following next_task clients.
+    assigned to the subsequent next_task-calling channels.
 
     Finally, once all Map/Reduce tasks are completed, the clients are
     given the 'disconnect' task.
 
     """
     # Possible .state
-    START	= 0		# Ready to start
-    MAPPING	= 1		# Performing Map phase of task
-    REDUCING	= 2		# Performing Reduce phase of task
-    FINISHING	= 3		# Performing finish phase, proparing results
-    FINISHED	= 4		# Final results available
+    IDLE	= 0		# Awaiting a datasource
+    START	= 1		# Ready to start; prep iterator, decide phase
+    MAPPING	= 2		# Performing Map phase of task
+    REDUCING	= 3		# Performing Reduce phase of task
+    FINISHING	= 4		# Performing Finish phase, preparing results
+    FINISHED	= 5		# Final results available; loop or quit
 
     # Possible .tasks option
     MAPREDUCE	= 0
@@ -1398,32 +1589,42 @@ class TaskManager(object):
     CONTINUOUS	= 0		# Continuously allocate tasks to every channel
     ONESHOT	= 1		# Only allocate a single Map/Reduce task to each
 
-    # Possible .cycles options
+    # Possible .cycle options
     SINGLEUSE   = 0		# After finishing, close Server and 'disconnect' clients
     PERMANENT   = 1		# Go idle 'til another Map/Reduce transaction starts
 
+    txn = "0"
     def __init__(self, datasource, server,
                  tasks=None, allocation=None, cycle=None):
         self.datasource = datasource
         self.server = server
-        self.state = TaskManager.START
+        self.state = TaskManager.IDLE
         self.tasks = tasks or TaskManager.MAPREDUCE
         self.allocation = allocation or TaskManager.CONTINUOUS
         self.cycle = cycle or TaskManager.SINGLEUSE
 
-        # Track what channels were last reported as being up to
-        # { addr: (command, timetamp), ... }
+        # Track what channels exist, and were last reported as being
+        # up to { addr: (command, timetamp), ... }
         self.channels = {}
+
+        # Each time we create another TaskManager (or an existing Task
+        # Manager moves onto a new Map/Reduce Transaction), we'll
+        # advance this.  This will enforce a new Transaction number
+        # for every possible transaction, during the possible lifespan
+        # of the python interpreter's connections to any Client
+        self.txn = str(int(self.txn) + 1)
+
 
     # 
     # channel_... -- maintain client .channels activity state
     # 
-    #     Tracks the command, response and time started for every 
-    # request.  If idle, the entry is None.
+    #     Tracks the command, response and time started for every
+    # request.  If idle, the entry is None (hit it with a
+    # .start_new_task() to get it going again)
     # 
     #     .channels = {
-    #         ('127.0.0.1, 12345): ('map', 'mapdone', 1234.5678 ),
-    #         ('127.0.0.1, 23456): ('map', None, 1235.6789 ),
+    #         ('127.0.0.1, 12345): (txn, 'map', 'mapdone', 1234.5678 ),
+    #         ('127.0.0.1, 23456): (txn, 'map', None, 1235.6789 ),
     #         ...
     #     }
     # 
@@ -1431,47 +1632,57 @@ class TaskManager(object):
         self.channel_idle(chan)
 
     def channel_closed(self, chan):
-        self.channel_log(chan, "Disconnecting")
+        self.channel_log(chan, "Disconnect")
         self.channels.pop(chan, None)
 
     def channel_idle(self, chan):
         self.channel_log(chan, "Idle")
         self.channels[chan] = None
 
-    def channel_sending(self, chan, command):
-        self.channels[chan] = (command, None, time.time())
+    def channel_sending(self, chan, command, txn):
+        if self.channels.get(chan, None):
+            self.channel_log(chan, "Done")
+        self.channels[chan] = (txn, command, None, time.time())
         self.channel_log(chan, "Sending")
 
-    def channel_process(self, chan, response):
+    def channel_process(self, chan, response, txn):
+        what = "Processing"
         try:
-            command, __, started = self.channels[chan]
+            cmdtxn, command, __, started = self.channels[chan]
         except:
+            cmdtxn = None
             command = None
             started = time.time()
-        self.channels[chan] = (command, response, started)
+            what = "Spontaneous"
+            
+        if txn != cmdtxn:
+            return
+        self.channels[chan] = (cmdtxn, command, response, started)
         self.channel_log(chan, "Processing")
 
-    def channel_log(self, chan, what):
+    def channel_log(self, chan, what, how = "info"):
         if chan is None:
             # No chan; Just print header
-            logging.debug('Client Address        Command Response Time State')
+            getattr(logging, how)("%-25s Time    State      Txn  Response  Command" % (
+                    "Channel"))
             return
-        try:
-            triplet = self.channels[chan]
-            if triplet is None:
-                logging.debug('Client %16.16s:%-5d %8s %8s %6.3fs: %s' % (
-                        chan.addr[0], chan.addr[1], 
-                        '','', 0.0, what))
-            else:
-                command, response, when = triplet
-                logging.debug('Client %16.16s:%-5d %8s %8s %6.3fs: %s' % (
-                        chan.addr[0], chan.addr[1],
-                        command, response, time.time() - when, what))
-        except KeyError:
-            logging.debug('Client %16.16s:%-5d Unknown' % (
-                    chan.addr[0], chan.addr[1]))
+        tpl = self.channels.get(chan, None)
+        if tpl is None:
+            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%s' % (
+                    chan.name(), 0.0, what,
+                    '', '',''))
+        else:
+            txn, command, response, when = tpl
+            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%s' % (
+                    chan.name(), time.time() - when, what,
+                    txn, response and response or "", command ))
 
     def next_task(self, channel):
+        if self.state == TaskManager.IDLE:
+            # Initial state (no datasource, or not yet appropriate
+            # to start.  Issue any clients an idle task.
+            return (None, None, None)
+
         if self.state == TaskManager.START:
             self.map_iter = iter(self.datasource)
             self.working_maps = {}
@@ -1493,7 +1704,7 @@ class TaskManager(object):
                 map_key = self.map_iter.next()
                 map_item = map_key, self.datasource[map_key]
                 self.working_maps[map_item[0]] = map_item[1]
-                return ('map', map_item)
+                return ('map', map_item, self.txn)
             except StopIteration:
                 # A complete iteration of map items is done; either
                 # pick a random one of those not yet complete to
@@ -1501,9 +1712,9 @@ class TaskManager(object):
                 if self.allocation is self.CONTINUOUS:
                     if len(self.working_maps) > 0:
                         key = random.choice(self.working_maps.keys())
-                        return ('map', (key, self.working_maps[key]))
+                        return ('map', (key, self.working_maps[key]), self.txn)
                 else:
-                    return (None, None)
+                    return (None, None, None)
 
                 # No more entries left to Map; begin Reduce (or skip)
                 self.state = TaskManager.REDUCING
@@ -1523,11 +1734,11 @@ class TaskManager(object):
             try:
                 reduce_item = self.reduce_iter.next()
                 self.working_reduces[reduce_item[0]] = reduce_item[1]
-                return ('reduce', reduce_item)
+                return ('reduce', reduce_item, self.txn)
             except StopIteration:
                 if len(self.working_reduces) > 0:
                     key = random.choice(self.working_reduces.keys())
-                    return ('reduce', (key, self.working_reduces[key]))
+                    return ('reduce', (key, self.working_reduces[key]), self.txn)
                 # No more entries left to Reduce; finish (self.results now valid)
                 self.state = TaskManager.FINISHING
 
@@ -1542,7 +1753,6 @@ class TaskManager(object):
                 self.results \
                     = dict( applyover(self.server.finishfn,
                                       self.results.iteritems()))
-
             self.state = TaskManager.FINISHED
 
         if self.state == TaskManager.FINISHED:
@@ -1556,10 +1766,19 @@ class TaskManager(object):
             if self.server.resultfn:
                 self.server.resultfn( self.results )
             self.server.handle_close()
-            return ('disconnect', None)
+            return ('disconnect', None, self.txn)
     
-    def map_done(self, data):
-        # Don't use the results if they've already been counted
+    def map_done(self, data, txn):
+        # Don't use the results if they've already been counted, or if
+        # they don't belong to this transaction!  Since clients may
+        # exist beyond the scope of one transaction, and may be
+        # blocked ordelayed nondeterministically, we can't assume that
+        # every Map or Reduce response was associated with this
+        # Transaction.
+        if txn != self.txn:
+            logging.error("%s Map result Transaction mismatch: %s != %s" % (
+                    self.server.name(), txn, self.txn ))
+            return
         if not data[0] in self.working_maps:
             return
         logging.debug("Map Done: %s ==> %s" % (data[0], repr.repr(data[1])))
@@ -1569,8 +1788,12 @@ class TaskManager(object):
             self.map_results[key].extend(values)
         del self.working_maps[data[0]]
                                 
-    def reduce_done(self, data):
+    def reduce_done(self, data, txn):
         # Don't use the results if they've already been counted
+        if txn != self.txn:
+            logging.error("%s Reduce result Transaction mismatch: %s != %s" % (
+                    self.server.name(), txn, self.txn ))
+            return
         if not data[0] in self.working_reduces:
             return
         logging.debug("Reduce Done: %s ==> %s" % (data[0], repr.repr(data[1])))
@@ -1578,27 +1801,46 @@ class TaskManager(object):
         del self.working_reduces[data[0]]
 
 
-class mincemeat_daemon(threading.Thread):
+class Mincemeat_daemon(threading.Thread):
     """
     A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
-    numeric 'timeout' on creation will cause timeout() to be fired
-    about every that many seconds.
+    numeric 'timeout=' keyword arg creation will cause timeout() to be
+    fired about every that many seconds.
 
-    Note that an overloaded Thread.run does *not* receive *args or
-    **kwargs!  Only a target method does...
+    Note that an overridden Thread.run method does *not* receive *args
+    or **kwargs; Only a target=... method does...
+
+    Raises exception on the Server's failure to bind, or a Client's
+    failure to connect.
+
+    After start(), processes 'til the processing loop completes, and
+    enters "success" state; if an exception terminates processing,
+    enters a "failure: ..." state.
     """
-    def __init__(self, *args, **kwargs):
+    def __init__(self, credentials=None, cls=None,
+                 map=None, schedule=None, shuttout=.5,
+                 *args, **kwargs):
         threading.Thread.__init__(self, target=self.process,
                                   args=args, kwargs=kwargs)
         self.daemon = True
-        self._state = "idle"
         if not hasattr(self, 'is_alive'):
             # Pre-2.6 threading.Thread didn't have is_alive...
             self.is_alive = self.isAlive
-        # The self.mincemeat will be an asyncore.dispatcher based
-        # mincemeat Client or Server, by the time construction is
-        # complete.
-        self.mincemeat = None
+
+        self._state = "idle"
+
+        # Instantiate the (NOT optional!) Client or Server class, and
+        # invoke its conn with the (also NOT optional) credentials.
+        # We make them none to ensure that they are not positional
+        # parameters, and force this to crash if not specified.
+        if map is None:
+            map = {}
+        if schedule is None:
+            schedule = collections.deque()
+        self.mincemeat = cls(map=map, schedule=schedule, shuttout=shuttout)
+
+        self.mincemeat.conn(asynchronous=True, **credentials)
+
 
     def name(self):
         return self.mincemeat.name()
@@ -1619,17 +1861,17 @@ class mincemeat_daemon(threading.Thread):
         with no timeout, 'til underlying mincemeat object is finished
         (its asyncore.dispatcher._map is empty).
 
-        If timeout() is overriden in derived class, passing alternate
-        'timeout' keyword arg to class consructor (eg. { 'timeout':
-        30.0 }), to implement a timed event-loop.
+        If timeout() is overriden in derived class, pass a
+        'timeout=#.#' keyword arg to class consructor (eg. {
+        'timeout': 30.0 }), to implement a timed event-loop.
         """
         logging.info("%s processing(%s, %s)" % (
                 self.name(), repr.repr(args), repr.repr(kwargs)))
         self._state = "processing"
         try:
             while self.mincemeat.process(*args, **kwargs):
-                self.timeout(True)
-            self.timeout(False)
+                self.timeout()
+            self.timeout(done=True)
         except Exception, e:
             logging.error("%s failed: %s" % (self.name(), e))
             self._state = "failed: %s" % e
@@ -1642,11 +1884,11 @@ class mincemeat_daemon(threading.Thread):
         logging.info("%s stopping: %s" % (
                 self.name(), self.state()))
 
-    def timeout(self, more):
+    def timeout(self, done=False):
         """
         Override in derived class (and pass a numeric 'timeout'
         keyword argument on daemon creation), if a timed event-loop is
-        desired.  It is invoked with more=True, 'til the event loop
+        desired.  It is invoked with done=True when the event loop
         detects completion.
         """
         pass
@@ -1671,63 +1913,23 @@ class mincemeat_daemon(threading.Thread):
             close_all(map=self.mincemeat._map, ignore_all=True)
             self.join()
 
-
-class Server_thread(mincemeat_daemon):
+class Client_daemon(Mincemeat_daemon):
     """
-    Run a Map/Reduce Server daemon, and process a single Map/Reduce task.
-
-    Raises exception on failure to create and connect a Server with
-    the given credentials (interface, port).  After start() is
-    invoked, it will drive stay in "processing" state 'til either
-    "success", or a "failed: ...".  
-    
-    When the state() reaches "success", results() may then be called.
-    Alternatively (or in addition), provide a 'resultfn' in the task
-    dictionary, and it will be invoked asynchronously with the
-    results, immediately on completion of the Map/Reduce task.
+    Start a mincemeat.Client (by default), as a daemon.
     """
-    def __init__(self, credentials, task, map=None, *args, **kwargs):
-        mincemeat_daemon.__init__(self, *args, **kwargs)
-        if map is None:
-            map = {}
-        self.mincemeat = Server(map=map, schedule=collections.deque(),
-                                shuttout=5.)
-        for k, v in task.iteritems():
-            setattr(self.mincemeat, k, v)
-        self.mincemeat.conn(asynchronous=True, **credentials)
+    def __init__(self, credentials, cls=Client,
+                 map=None, schedule=None, shuttout=.5,
+                 *args, **kwargs):
+        Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
-    def results(self):
-        """
-        Harvest the Server results (if we don't use the 'resultfn' callback)
-        """
-        return self.mincemeat.results()
-
-
-class Client_thread(mincemeat_daemon):
+class Server_daemon(Mincemeat_daemon):
     """
-    Run a Map/Reduce Client daemon, using the specified socket map
-    (None implies a private map).  If another socket map is specified,
-    then remember that this thread's run method will process the
-    asyncore.loop, and will therefore process events on other sockets
-    in the map; no other asyncore.loop should be invoked with this
-    map!  Any additional keyword args are (ultimately) passed to the
-    Thread.run() method (eg. 'timeout', to produced a periodic
-    invocation of the timeout() method)
-
-    Raises exception on the client's failure to bind to a Server.
-
-    After start(), processes 'til the processing loop completes, and
-    enters "success" state; if an exception terminates processing,
-    enters a "failure: ..." state.
+    Start a mincemeat.Server (by default), as a daemon.
     """
-    def __init__(self, credentials, map=None, *args, **kwargs):
-        mincemeat_daemon.__init__(self, *args, **kwargs)
-        if map is None:
-            map = {}
-        self.mincemeat = Client(map=map, schedule=collections.deque(),
-                                shuttout=5.)
-        self.mincemeat.conn(asynchronous=True, **credentials)
-
+    def __init__(self, credentials, cls=Server,
+                 map=None, schedule=None, shuttout=.5,
+                 *args, **kwargs):
+        Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)
