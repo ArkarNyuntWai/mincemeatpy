@@ -263,12 +263,16 @@ class Cli(mincemeat.Client_daemon):
         The Client_daemon's process (asyncore.loop) thread is invoking
         us; use send_command; send_command_backchannel not necessary.
         """
-        logging.info("%s timeout %s" % (
+        logging.info("%s Cli timeout %s" % (
                 self.name(), done and "done" or ""))
-        self.mincemeat.send_command("ping", ( "Client Timeout from %s" % (
-                                             socket.getfqdn()), 
-                                        "%s" % ( 
-                                             threading.current_thread().name )))
+        # Note that we've overridden the threading.Thread.name
+        # property in mincemeat.Potocol, so we need to call
+        # it directly in order to use it...
+        self.mincemeat.send_command(
+            "ping", ( "Client from %s" % ( socket.getfqdn()), 
+                      threading.Thread.name.__get__(
+                          threading.current_thread() )))
+
 class Client_Repl(mincemeat.Client):
     """
     A mincemeat.Client that knows how to process the "transactiondone"
@@ -293,18 +297,12 @@ class Svr(mincemeat.Server_daemon):
         us; it also runs all the Server's ServerChannel's; hence, we
         use send_command, send_command_backchannel not necessary.
         """
-        logging.info("%s timeout %s" % (
+        logging.info("%s Svr timeout %s" % (
                 self.name(), done and "done" or ""))
 
         self.mincemeat.taskmanager.channel_log(None, "")
         for chan in self.mincemeat.taskmanager.channels.keys():
             self.mincemeat.taskmanager.channel_log(chan, "")
-
-            #chan.send_command("ping", ( "Server Timeout from %s" % (
-            #                                 socket.getfqdn()), 
-            #                            "%s" % ( 
-            #                                 threading.current_thread().name )))
-
 
 class Server_Repl(mincemeat.Server):
     """
@@ -469,9 +467,7 @@ def main():
 
             cli.mincemeat.send_command_backchannel(
                 "ping", ( "Request from %s" % ( socket.getfqdn()),
-                          #'x' * 1 * 1000 * 1000 ))		# a big blob, or
-                          "%s" % threading.current_thread().name ))
-                          #req ))				# client request
+                          str( threading.current_thread().name )))
 
             time.sleep( 5 )
 
