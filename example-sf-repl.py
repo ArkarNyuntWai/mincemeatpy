@@ -204,23 +204,33 @@ global_results = collections.deque()
 def store_results(results):
     global_results.append( results )
 
-def server_results(results):
+def server_results(results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
+
+    # Collect lists of all words with each unique count
     bycount = {}
-    for k,v in results.items():
-        if v in bycount:
-            bycount[v].append(k)
+    for wrd,cnt in results.items():
+        if cnt in bycount:
+            bycount[cnt].append(wrd)
         else:
-            bycount[v] = [k]
-    
+            bycount[cnt] = [wrd]
+
+    # Create linear list of words sorted by count (limit to top #)
     bycountlist = []
-    for k,l in sorted(bycount.items()):
-        for w in sorted(l):
-            bycountlist.append((k, w))
-    
-    for k, lt in zip(sorted(results.keys()), bycountlist):
-        print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
+    for cnt in sorted(bycount.keys(), reverse=True):
+        for wrd in sorted(bycount[cnt]):
+            bycountlist.append((cnt, wrd))
+        if top and len(bycountlist) >= top:
+            break
+
+    print "bycount:", repr.repr( bycount ), "bycountlist:", repr.repr( bycountlist )
+
+    # Print two columns; one sorted lexicographically, one by count
+    for wrd, cnt_wrd in zip(sorted([wrd for __,wrd in bycountlist],
+                                   reverse=True),
+                            reversed(bycountlist)):
+        print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
 
 #resultfn = None
 #resultfn = server_results      # Process directly (using asyncore.loop thread)
@@ -423,7 +433,7 @@ def REPL( cli ):
             print ".",
             time.sleep( 1 )
         if global_results:
-            server_results( global_results.popleft() )
+            server_results( global_results.popleft(), top=100 )
     
 
 def main():
