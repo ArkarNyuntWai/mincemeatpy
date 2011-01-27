@@ -229,8 +229,6 @@ def server_results(txn, results, top=None):
         if top and len(bycountlist) >= top:
             break
 
-    print "bycount:", repr.repr( bycount ), "bycountlist:", repr.repr( bycountlist )
-
     # Print two columns; one sorted lexicographically, one by count
     for wrd, cnt_wrd in zip(sorted([wrd for __,wrd in bycountlist],
                                    reverse=True),
@@ -344,7 +342,7 @@ class Client_Repl(mincemeat.Client):
 
     def unrecognized_command(self, command, data=None, txn=None):
         """
-        Store the results; let the main thread detect and print new results.
+        Store the results; let the main REPL thread detect and print them.
         """
         logging.info("%s received command: %s %s" % (
                 self.name(), 
@@ -357,6 +355,7 @@ class Client_Repl(mincemeat.Client):
 
         return False
 
+
 class Svr(mincemeat.Server_daemon):
 
     def timeout(self, done=False):
@@ -364,14 +363,12 @@ class Svr(mincemeat.Server_daemon):
         The Server_daemon's process (asyncore.loop) thread is invoking
         us; it also runs all the Server's ServerChannel's; hence, we
         use send_command, send_command_backchannel not necessary.
+
+        We don't have anything to do, but we set this up as an example.
         """
-        pass
-        logging.info("%s Svr timeout %s" % (
+        logging.debug("%s Svr timeout %s" % (
                 self.name(), done and "done" or ""))
 
-        self.mincemeat.taskmanager.channel_log(None, "")
-        for chan in self.mincemeat.taskmanager.channels.keys():
-            self.mincemeat.taskmanager.channel_log(chan, "")
 
 class Server_Repl(mincemeat.Server):
     """
@@ -409,21 +406,26 @@ class Server_Repl(mincemeat.Server):
             path = os.path.join( "../Gutenberg SF CD/Gutenberg SF",
                                  str(data))
             data = file_contents( path )
-            logging.info("%s Map/Reduce Transaction: %s ==> %d files" % (
-                    self.name(), path, len(data)))
-
             loctxn = str(self.loctxn)
             self.loctxn += 1
+
+            # We MUST put in place the "in-flight" mapping of this
+            # local txn, to the correspoding Client txn and channel,
+            # BEFORE we set the data source; if the datasource is
+            # empty, processing will be immediate (as set_datasource
+            # will jump-start the TaskManager, producing a call to
+            # resultfn directly).
+            logging.warning("%s Map/Reduce txn %s: %s ==> %d files" % (
+                self.name(), loctxn, path, len(data)))
+            self.inflight[loctxn] = {
+                'txn':          txn,
+                'chan':         chan,
+                }
             self.set_datasource(
                 datasource      = data,
                 txn             = loctxn,
                 allocation      = mincemeat.TaskManager.CONTINUOUS,
                 cycle           = mincemeat.TaskManager.PERMANENT )
-
-            self.inflight.update({loctxn: {
-                'txn':          txn,
-                'chan':         chan,
-                }})
             return True
 
         return False
@@ -435,14 +437,17 @@ class Server_Repl(mincemeat.Server):
         the Client.
         """
         client = self.inflight.pop(txn, None)
-        if client:
-            logging.warning("%s sending txn %s results back via %s" % (
-                    self.name(), txn, client['chan'].name()))
+        if client is not None:
+            # Got results (they may be empty, but this is a valid result)
+            logging.warning("%s Map/Reduce txn %s: results via %s: %s" % (
+                    self.name(), txn, client['chan'].name(),
+                    repr.repr(results)))
             client['chan'].send_command( "transactiondone", data=results,
                                          txn=client['txn'] )
         else:
-            logging.warning("%s unable to identify txn %s results: %s" % (
-                    self.name(), txn, repr.repr( results )))
+            logging.error("%s unable to identify txn %s results in %s: %s" % (
+                    self.name(), txn, repr.repr(self.inflight),
+                    repr.repr(results)))
 
 
 def REPL( cli ):
@@ -451,22 +456,27 @@ def REPL( cli ):
     Client.
 
     Since Windows (unbelievably) cannot await async I/O on both a
-    socket and the console, we must use a separate thread...  A blank
-    line will terminate input.
+    socket and the console, we must use a separate thread...  EOF (^D
+    on Posix systems) will terminate input.
     """
     txn = 0
     print "Which files?  eg. '*.txt<enter>'"
     while cli.is_alive():
         print "GLOB> ",
         try:
-            inp = sys.stdin.readline().rstrip()
+            inp = sys.stdin.readline()
         except:
             inp = None
         if inp:
-            cli.mincemeat.send_command_backchannel("transaction", inp,
-                                                    txn=str(txn))
+            inp = inp.rstrip()
+            if inp:
+                cli.mincemeat.send_command_backchannel("transaction", inp,
+                                                       txn=str(txn))
+            else:
+                # blank line
+                continue
         else:
-            # EOF or newline
+            # EOF
             break
         txn += 1
 

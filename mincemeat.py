@@ -409,7 +409,7 @@ class threaded_async_chat(asynchat.async_chat):
                          # There's a good chance that we might be able
                          # to cleanly shutdown the outgoing half, and
                          # flow an EOF through
-                         logging.info("%s shut down to peer %s" % (
+                         logging.debug("%s shut down to peer %s" % (
                                  self.name(), str(self.addr)))
                          self.socket.shutdown(socket.SHUT_WR)
                          return True
@@ -417,9 +417,9 @@ class threaded_async_chat(asynchat.async_chat):
                     logging.warning("%s shut down failed: %s" % (
                             self.name(), e ))
             else:
-                logging.info("%s shut down at EOF!" % self.name())
+                logging.debug("%s shut down at EOF!" % self.name())
         else:
-            logging.info("%s shut down already!" % self.name())
+            logging.debug("%s shut down already!" % self.name())
 
         return False
 
@@ -612,7 +612,7 @@ class Protocol(threaded_async_chat):
             command += "/" + str(txn)
         if not ":" in command:
             command += ":"
-        if data:
+        if data is not None:	# An empty container is different than None!
             pdata = pickle.dumps(data)
             command += str(len(pdata))
             logging.debug("%s -->%s(%s)" % (self.name(), command, repr.repr(data)))
@@ -749,7 +749,7 @@ class Protocol(threaded_async_chat):
             # schedule to handle them, or an exception while
             # attempting to shut down socket and schedule a future
             # cleanup.  Just close.
-            logging.debug("%s closing connection to peer %s" % (
+            logging.info("%s closing connection to peer %s" % (
                     self.name(), str(self.addr)))
             self.close()
 
@@ -1274,7 +1274,9 @@ class Server(asyncore.dispatcher, object):
         'til after the TaskManager is done the final Map/Reduce
         transaction!
         """
-        return self.taskmanager.state == TaskManager.FINISHED or bool(self.output)
+        return ( self.taskmanager.state in [TaskManager.IDLE,
+                                            TaskManager.FINISHED]
+                 or bool(self.output))
 
     def results(self):
         """
@@ -1831,7 +1833,9 @@ class TaskManager(object):
             if transaction:
                 logging.warning("%s unrecognized TaskManager configuration: %s " % (
                     self.server.name(), repr.repr(transaction)))
-            if self.datasource:
+            if self.datasource is not None:
+                # Got a datasource; may be empty (we want to return
+                # empty results), but isn't None; Fire it up
                 self.state = TaskManager.START
             else:
                 # Initial state (no datasource, or not yet appropriate
