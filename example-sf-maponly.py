@@ -4,7 +4,7 @@ import glob
 import logging
 import repr
 
-'''
+"""
 example-sf-maponly	-- skips reduce phase (run finish func. in server)
 
     To run this test, first start the example Map-Reduce server; this
@@ -31,7 +31,7 @@ interface "localhost"):
 
 Alternatively, here is a iterable that returns the contents of a set of
 files designated by name (or a "glob" pattern match):
-'''
+"""
 
 class file_contents(object):
     def __init__(self, pattern ):

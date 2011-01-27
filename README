@@ -5,7 +5,7 @@ mincemeat.py is licensed under the MIT license. See LICENSE for more details
 
 REQUIREMENTS
 
-Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/haslib/sha1
+Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/hashlib/sha1
 
 
 EXAMPLES
@@ -75,6 +75,17 @@ control over the lifespan of the instances (eg. a web server farm,
 
 This will run a client and a server!  To speed it up, create more
 clients by running the same command.
+
+
+* Client-driven REPL for submitting Map/Reduce tasks
+
+A much more complex example allows multiple Clients to be established,
+each of which may independently submit Map/Reduce Transaction to the
+(automatically created) Server.  A prompt is printed on the console,
+allowing a file name pattern (including "glob" wildcards) to be
+specified, and the matching files are word-counted.
+
+    python example-sf-repr.py
 
 
 TOPOLOGY

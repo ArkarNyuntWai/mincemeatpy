@@ -8,10 +8,11 @@ import errno
 import asyncore
 import threading
 import time
+import traceback
 import sys
 
-'''
-example-sf-daemon	-- elect a server, become a client, issue requests
+"""
+example-sf-daemon       -- elect a server, become a client, issue requests
 
     To run this test, simply start an instances of this script:
 
@@ -20,8 +21,7 @@ example-sf-daemon	-- elect a server, become a client, issue requests
 Each client may schedule Map-Reduce  for the server, and receive
 the results of those tasks sometime in the future.  Of course, each
 client also receives map and reduce tasks from the server.
-
-'''
+"""
 
 class file_contents(object):
     def __init__(self, pattern ):
@@ -41,7 +41,7 @@ class file_contents(object):
             f.close()
 
 # Obtain CD ISO from: http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
-datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
+datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*18*.txt' )
 
 # 
 # Map Functions.
@@ -87,14 +87,14 @@ def get_lower_simple( k, v ):
 # 
 def sum_values( k, vs ):
     try:
-        return sum( vs )		# Will throw unless vs is iterable, summable
+        return sum( vs )                # Will throw unless vs is iterable, summable
     except TypeError:
         return vs
 
 def sum_values_generator( kvi ):
     for k, vs in kvi:
         try:
-            yield k, sum( vs )		# Will throw unless vs is iterable, summable
+            yield k, sum( vs )          # Will throw unless vs is iterable, summable
         except TypeError:
             yield k, vs
 
@@ -194,7 +194,12 @@ finishfn = sum_values
 # immediately with the final results upon completion.
 # 
 
-def server_results(results):
+global_results = []
+
+def store_results(txn, results):
+    global_results.append((txn, results))
+
+def server_results(txn, results):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
     bycount = {}
@@ -213,29 +218,64 @@ def server_results(results):
         print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
 
 #resultfn = None
-resultfn = server_results
+#resultfn = server_results      # Process directly (using asyncore.loop thread)
+resultfn = store_results        # Store for processing later
 
 
-addr_info = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT,
-}
 
-task_spec = {
-    'datasource': 	datasource,
-    'mapfn':		mapfn,
-    'collectfn':	collectfn,
-    'reducefn':		reducefn,
-    'finishfn':		finishfn,
-    'resultfn':		resultfn,
+credentials = {
+    'password':         'changeme',
+    'interface':        'localhost',
+    'port':             mincemeat.DEFAULT_PORT,
+
+    'datasource':       datasource,
+    'mapfn':            mapfn,
+    'collectfn':        collectfn,
+    'reducefn':         reducefn,
+    'finishfn':         finishfn,
+    'resultfn':         resultfn,
 }
     
-def logchange( who, state, current ):
-    if current != state:
-        logging.info("%s was %s; now %s" % ( who, state, current ))
+def logchange( who, previous ):
+    current = who.state()
+    if current != previous:
+        logging.info("%s was %s; now %s" % ( who.name(), previous, current ))
     return current
     
+
+# Use the main service thread timeout facility to send commands; NOT
+# send_back_channel, as required for externally-initiated commands!
+
+class Cli(mincemeat.Client_daemon):
+
+    def timeout(self, done=False):
+        """
+        The Client_thread's process (asyncore.loop) thread is invoking
+        us; use send_command, NOT send_command_backchannel.
+        """
+        logging.info("%s timeout %s" % (
+                self.name(), done and "done" or ""))
+        self.mincemeat.send_command("ping", ( "Client Timeout from %s" % (
+                                             socket.getfqdn()), 
+                                        "%s -- Client loop" % ( 
+                                             threading.current_thread().name )))
+
+class Svr(mincemeat.Server_daemon):
+
+    def timeout(self, done=False):
+        """
+        The Server_thread's process (asyncore.loop) thread is invoking
+        us; it also runs all the Server's ServerChannel's; hence, we
+        use send_command, NOT send_command_backchannel.
+        """
+        logging.info("%s timeout %s" % (
+                self.name(), done and "done" or ""))
+        for chan in self.mincemeat.taskmanager.channels.keys():
+            chan.send_command("ping", ( "Server Timeout from %s" % (
+                                             socket.getfqdn()), 
+                                        "%s -- Server loop" % ( 
+                                             threading.current_thread().name )))
+
 def main():
     cli = None
     clista = "(none)"
@@ -248,20 +288,21 @@ def main():
         # may need to attempt creating a Client or a Server several
         # times.
         begun = time.clock()
-        limit = 5.0			# Wait for this time, total
-        cycle = 0.1			# Wait about this long per cycle
+        limit = 5.0                     # Wait for this time, total
+        cycle = 0.1                     # Wait about this long per cycle
         while time.clock() < begun + limit:
             if not cli:
                 # No client yet? Create one.  May sometimes throw
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = mincemeat.Client_thread(credentials = addr_info)
-                    clista = logchange( "Client", clista, cli.state() )
+                    cli = Cli(credentials, timeout=5.0)
+                    clista = logchange( cli, clista )
                     cli.start()
-                    clista = logchange( "Client", clista, cli.state() )
+                    clista = logchange( cli, clista )
                 except Exception, e:
-                    logging.warning("Client thread failed: %s" % e)
+                    logging.warning("Client thread failed: %s\n%s" % (
+                            e, traceback.format_exc()))
 
             time.sleep(cycle)
 
@@ -269,7 +310,7 @@ def main():
                 # Client exists.  Keep checking state; must reach at
                 # least "authenticated"; may (if Server is quick),
                 # actually reach "success"!
-                clista = logchange( "Client", clista, cli.state() )
+                clista = logchange( cli, clista )
                 if cli.state() in ( "authenticated", "success" ):
                     # Success!  Up and running.
                     break
@@ -282,18 +323,17 @@ def main():
                 # Client didn't come up and/or didn't immediately
                 # authenticate.  Create a Server.
                 try:
-                    svr = mincemeat.Server_thread(credentials = addr_info,
-                                                  task	      = task_spec)
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svr = Svr(credentials, timeout=5.0)
+                    svrsta = logchange( svr, svrsta )
                     svr.start()
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svrsta = logchange( svr, svrsta )
                 except Exception, e:
                     # The bind probably failed; Server couldn't
                     # bind,...  Perhaps someone else beat us to it!
                     logging.warning("Server thread failed: %s" % e)
 
             if svr:
-                svrsta = logchange( "Server", svrsta, svr.state() )
+                svrsta = logchange( svr, svrsta )
                 if svrsta.startswith("fail"):
                     logging.warning("Server failed; trying again...")
                     svr.stop(cycle)
@@ -314,18 +354,24 @@ def main():
             # thread is done.  Send pings (with no timeout on
             # transmission) every second.  This means that, upon failure to 
             # transmit
-
-            while cli.isAlive():
-                clista = logchange( "Client", clista, cli.state() )
+            while cli.is_alive():
+                clista = logchange( cli, clista )
                 if svr:
-                    svrsta = logchange( "Server", svrsta, svr.state() )
+                    svrsta = logchange( svr, svrsta )
                 begun = time.clock()
-                cli.send( "ping", ( "Request from %s" % socket.getfqdn(),
-                                    'x' * 1 * 1000 * 1000 ))
-                logging.info("Transmitted ping in %.4fs" % ( time.clock() - begun ))
-                time.sleep( 1 )
+                cli.mincemeat.send_command_backchannel(
+                    "ping", ( "Request from %s" % ( socket.getfqdn()),
+                               #'x' * 1 * 1000 * 1000 ))        # a big blob...
+                              "%s -- main thread" % (           # a thread name
+                                  threading.current_thread().name )))
+                time.sleep( 5 )
 
-            # Done! Client has exited.
+            # Done! Client has exited.  Log any results available, if
+            # we were running Server
+            while global_results:
+                server_results( *global_results[0] )
+                del global_results[0]
+
 
     except KeyboardInterrupt:
         logging.info("Manual shutdown requested")
@@ -341,15 +387,15 @@ def main():
 
     # Ensure that everything exited cleanly.  The Server should be
     # done, and should have finished() and produced results().
+    code = 0
     if cli and cli.state() != "success":
         logging.error("Client thread didn't exit cleanly: %s" % cli.state())
+        code = 1
     if svr and svr.state() != "success":
         logging.error("Server thread didn't exit cleanly: %s" % svr.state())
-
-    return (    ( not cli or cli.state() == "success" ) 
-            and ( not svr or svr.state() == "success" ))
+        code = 1
+    return code
 
 if __name__ == '__main__':
     logging.basicConfig( level=logging.INFO )
     sys.exit(main())
-
