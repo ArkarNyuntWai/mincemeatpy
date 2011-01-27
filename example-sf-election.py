@@ -7,7 +7,7 @@ import socket
 import asyncore
 
 """
-example-sf-election	-- elects (self) as server, or become a client
+example-sf-election     -- elects (self) as server, or become a client
 
     To run this test, simply start multiple instances of this script:
 
@@ -53,7 +53,7 @@ class file_contents(object):
             f.close()
 
 # Obtain CD ISO from: http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
-datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
+datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*moon*.txt' )
 
 # 
 # Map Functions.
@@ -99,14 +99,14 @@ def get_lower_simple( k, v ):
 # 
 def sum_values( k, vs ):
     try:
-        return sum( vs )		# Will throw unless vs is iterable, summable
+        return sum( vs )                # Will throw unless vs is iterable, summable
     except TypeError:
         return vs
 
 def sum_values_generator( kvi ):
     for k, vs in kvi:
         try:
-            yield k, sum( vs )		# Will throw unless vs is iterable, summable
+            yield k, sum( vs )          # Will throw unless vs is iterable, summable
         except TypeError:
             yield k, vs
 
@@ -203,9 +203,9 @@ finishfn = None
 # hosts.  Note that the empty string '' implies INADDR_ANY for bind, and
 # 
 addr_info = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT
+    'password':         'changeme',
+    'interface':        'localhost',
+    'port':             mincemeat.DEFAULT_PORT
 }
     
 

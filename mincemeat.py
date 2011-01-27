@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from __future__ import with_statement
-
 ################################################################################
 # Copyright (c) 2010 Michael Fairley
 #
@@ -24,6 +22,8 @@ from __future__ import with_statement
 # THE SOFTWARE.
 ################################################################################
 
+from __future__ import with_statement
+
 import asynchat
 import asyncore
 import cPickle as pickle
@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import logging
 import marshal
+import new
 import optparse
 import os
 import random
@@ -39,12 +40,11 @@ import repr
 import select
 import socket
 import sys
-import types
-import new
 import threading
 import time
 import timeit
 import traceback
+import types
 
 VERSION = 0.0
 
@@ -143,7 +143,7 @@ def process(timeout=None, map=None, schedule=None):
 
         beg = now = timer()
         dur = 0.0
-        while map and ( timeout is None or dur <= timeout ):
+        while map and (timeout is None or dur <= timeout):
             # Events on 'map' still possible, and either 'timeout' is
             # infinite, or we haven't yet exceeded it.  NOTE: We
             # *always* want to do at least one cycle, even if timeout
@@ -170,7 +170,7 @@ def process(timeout=None, map=None, schedule=None):
                     # remove it and get next one (if any).  We'll
                     # always refresh 'now' after every fun() firing,
                     # b/c arbitrary time has elapsed.
-                    schedule.remove( (exp,fun) )
+                    schedule.remove((exp,fun))
                     now = timer()
                     exp = None
             
@@ -225,7 +225,7 @@ def close_all(map=None, ignore_all=False):
         try: 
             asyncore.close_all(map=map)
         except Exception, e:
-            logging.warning( "Pre-2.6 asyncore; socket map cleanup incomplete: %s" % e )
+            logging.warning("Pre-2.6 asyncore; socket map cleanup incomplete: %s" % (e))
     
 
 
@@ -520,21 +520,23 @@ class Protocol(threaded_async_chat):
             if self.addr is None:
                 self.addr = addr
             elif self.addr != addr:
-                logging.info("%s resolved peer address %s to %s" % (
+                logging.debug("%s resolved peer address %s to %s" % (
                         self.name(), str(self.addr), str(addr)))
                 self.addr = addr
         except Exception, e:
-            logging.info( "Couldn't update peer address: %s" % e )
+            logging.info("%s couldn't update peer address: %s" % (
+                    self.name(), e))
             pass
 
         try:
             locl = self.socket.getsockname()
             if self.locl is None or self.locl != locl:
-                logging.info("%s resolved locl address %s to %s" % (
+                logging.debug("%s resolved locl address %s to %s" % (
                         self.name(), str(self.locl), str(locl)))
                 self.locl = locl
         except Exception, e:
-            logging.info( "Couldn't update locl address: %s" % e )
+            logging.info("%s couldn't update locl address: %s" % (
+                    self.name(), e))
             pass
 
     def connect(self, addr):
@@ -547,21 +549,24 @@ class Protocol(threaded_async_chat):
         establishes endpoint addresses; on the connect path, we don't
         know the actual .addr (peer addr) and .locl (local ephemeral
         addr), 'til the connect completes.  Since we are on the
-        connect path, default to showing the local i'face in our name.
+        connect path, default to showing the local i'face in our name
+        (once we're connected, and actually know our ephemeral
+        port...)
         """
         if self.addr is None:
             self.addr = addr
         self.name(peer=False)
-        logging.info( "%s connecting to %s" % ( self.name(), addr ))
+        logging.info("%s connecting" % (self.name()))
         threaded_async_chat.connect(self, addr)
 
     def handle_connect(self):
         """
-        A connect has completed!  We probably need to detect the local
-        interface address...
+        A connect appears to have completed!  We probably need to
+        detect the local interface address...  However, certain
+        connect failures may show up at this point.
         """
         self.update_addresses()
-        logging.info("%s connection established %s->%s" % (
+        logging.debug("%s connection established %s->%s" % (
                 self.name(),
                 str(self.locl), str(self.addr)))
 
@@ -610,10 +615,10 @@ class Protocol(threaded_async_chat):
         if data:
             pdata = pickle.dumps(data)
             command += str(len(pdata))
-            logging.debug( "%s -->%s( %s )" % (self.name(), command, repr.repr(data)))
+            logging.debug("%s -->%s(%s)" % (self.name(), command, repr.repr(data)))
             self.push(command + "\n" + pdata)
         else:
-            logging.debug( "%s -->%s" % (self.name(), command))
+            logging.debug("%s -->%s" % (self.name(), command))
             self.push(command + "\n")
 
     def send_command_backchannel(self, command, data=None, txn=None, timeout=None):
@@ -737,14 +742,14 @@ class Protocol(threaded_async_chat):
              and self.tidy_close():
             # We performed a tidy close!  Schedule a real close, in
             # case it doesn't flow through...
-            self.schedule.append( (timer() + self.shuttout, 
-                                   self.handle_close) )
+            self.schedule.append((timer() + self.shuttout, 
+                                   self.handle_close))
         else:
             # Already did a shutdown, no connection timeouts, or no
             # schedule to handle them, or an exception while
             # attempting to shut down socket and schedule a future
             # cleanup.  Just close.
-            logging.info("%s closing connection to peer %s" % (
+            logging.debug("%s closing connection to peer %s" % (
                     self.name(), str(self.addr)))
             self.close()
 
@@ -891,10 +896,10 @@ class Protocol(threaded_async_chat):
             commands[command](command, data, txn)
             return True
 
-        if self.unrecognized_command( command, data, txn):
+        if self.unrecognized_command(command, data, txn):
             return True
 
-        self.failed_command( command, data, txn)
+        self.failed_command(command, data, txn)
         return False
 
     def unrecognized_command(self, command, data=None, txn=None):
@@ -955,10 +960,10 @@ class Protocol(threaded_async_chat):
         if clos_tupl:
             ncells = range(len(clos_tupl))
             src = '\n'.join(
-                [ "def _f(arg):" ] +
-                [ "  _%d = arg[%d] "     % ( n, n ) for n in ncells ] +
-                [ "  return lambda:(%s)" % ','.join( "_%d" %n for n in ncells ) ] +
-                [ "" ])
+                ["def _f(arg):"] +
+                ["  _%d = arg[%d] "     % (n, n) for n in ncells] +
+                ["  return lambda:(%s)" % ','.join("_%d" %n for n in ncells)] +
+                [""])
             try:
                 exec src
             except:
@@ -1067,7 +1072,7 @@ class Client(Protocol):
 
         The (optional) .collectfn takes a list, and returns a simple
         value (just like a 'reducefn', incidentally); it is therefore
-        wrapped to produce a ( key, [ value ] ) tuple, as would be
+        wrapped to produce a (key, [value]) tuple, as would be
         produced by the normal Map phase.  We use 'applyover' to
         handle either simple functions operating on each individual
         (key,[value,...])  item, or generators which operate over the
@@ -1115,7 +1120,7 @@ class Client(Protocol):
         allows us to use the same function interchangably for
         collectfn, reducefn or finishfn (as appropriate).
         """
-        logging.info( "%s Reducing %s" % (self.name(), repr.repr(data)))
+        logging.info("%s Reducing %s" % (self.name(), repr.repr(data)))
         rgen = applyover(self.reducefn, [data])
         results = list(rgen)
         if len(results) != 1:
@@ -1214,7 +1219,7 @@ class Server(asyncore.dispatcher, object):
         self.schedule = schedule
         self.shuttout = shuttout        # If None, no shutdown timeout (just close)
 
-        self.taskmanager = None
+        self.taskmanager = TaskManager(self)
         self.password = None
         self.shutdown = False           # Termination indication to clients
 
@@ -1222,17 +1227,77 @@ class Server(asyncore.dispatcher, object):
         self.collectfn = None
         self.reducefn = None
         self.finishfn = None
-        self.resultfn = None
 
+        self.output = collections.deque()
+
+    def resultfn(self, txn, results):
+        """
+        By default, just collect up the results in self.output.
+
+        This may be overridden in a derived class:
+
+            class My_Server(mincemeat.Server):
+                def resultfn(txn, results):
+                    ...
+
+        or (as with the other configurable Server methods like
+        .mapfn), redefined by a assignment:
+
+            s = mincemeat.Server()
+            s.resultfn = my_resultfn
+
+        or by passing extra keyword args to 'conn':
+
+            s.conn(..., resultfn=my_resultfn)
+
+        NOTE: If you DO override this to handle results directly, you
+        probably should look at your use of finished() and results(),
+        to see if they make sense.  We use finished() to determine the
+        successful completion of a Server or Client Mincemeat_daemon,
+        and this usage will still work, because finished() retursn
+        True if the Server's TaskManager achieves FINISHED state (the
+        final Map/Reduce Transaction was done).
+        """
+        self.output.append((txn, results))
 
     # -------------------------------------------------------------------------
     # Methods required by Mincemeat_daemon
 
+    def finished(self):
+        """
+        Detect if finished (either completely, or a Transaction), by
+        checking if the TaskManager is completely done, or something
+        is available on the output deque.
+        
+        If you've overridden resultfn to handle results differently,
+        this may not work as you expect; it'll never report "finished"
+        'til after the TaskManager is done the final Map/Reduce
+        transaction!
+        """
+        return self.taskmanager.state == TaskManager.FINISHED or bool(self.output)
+
+    def results(self):
+        """
+        Successfully completed Map/Reduce.  Return results (discards
+        the 'txn'; override or redefine resultfn if you need it).
+
+        If you've overridden resultfn to handle results differently,
+        this will probably just always return None.
+        """
+        if not bool(self.output):
+            # No output available.  Return nothing.
+            return None
+        txn, results = self.output.popleft()
+        return results
+
     def authenticated(self):
         """
-        Server has no authenticated phase; only its ServerChannels and Clients
+        Server has no authenticated phase; only its ServerChannel.
+        Therefore, we always deem ourselves to be Authenticated.  This
+        is one of the factors used by the Mincemeat_daemon in
+        determining a successful completion state.
         """
-        return False
+        return True
 
     def name(self):
         """
@@ -1252,11 +1317,18 @@ class Server(asyncore.dispatcher, object):
     def run_server(self, password="", port=DEFAULT_PORT, interface="",
                    asynchronous=False):
         """
-        Runs the Server.  Use this method in the default asynchronous
-        == False form, if and only if this the only asyncore based
-        application running in this Python instance!  Otherwise, use
-        the component methods (ensure that the caller runs
-        asyncore.loop in another thread.)
+        Runs the Server, by default synchronously, returning the
+        results when done.
+
+        Use this method in the default asynchronous == False form, if
+        and only if this the only asyncore based object running in
+        this Python instance (or you wish to run all other
+        asyncore-based services with out asyncore.loop thread)!  This
+        is because the default constructor uses the global asyncore
+        socket map, shared with all other asyncore objects.
+
+        Otherwise, use the component methods (ensure that the caller
+        runs asyncore.loop in another thread.)
 
             s = mincemeat.Server()
             s.datasource = ...
@@ -1265,7 +1337,7 @@ class Server(asyncore.dispatcher, object):
             s.reducefn = ...
             s.finishfn = ...
             
-            s.setup(**credentials)
+            s.conn(**credentials)
         
             ac = threading.Thread(target=s.process)
             ac.start()
@@ -1275,10 +1347,7 @@ class Server(asyncore.dispatcher, object):
 
             results = s.results()
 
-        Note that using asynchronous = True requires that the caller
-        has created at least one asyncore based object (or the
-        asyncore.loop() call will return instantly, and the Thread
-        will terminate...
+        See the example*.py files for samples of various usages.
         """
         self.conn(password=password, port=port, interface=interface,
                    asynchronous=asynchronous)
@@ -1322,25 +1391,26 @@ class Server(asyncore.dispatcher, object):
             if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
                 # Windows socket re-use semantics differ from *nix (read:
                 # are broken).  See http://goo.gl/J89cr
-                self.socket.setsockopt( socket.SOL_SOCKET,
+                self.socket.setsockopt(socket.SOL_SOCKET,
                                         socket.SO_EXCLUSIVEADDRUSE, 1)
             self.bind((interface, port))
-            self.listen(1)
-        except:
+            self.listen(5)
+        except Exception, e:
             # If anything fails during socket creation, we need to
             # ensure we clean up the partially opened socket;
             # otherwise, it'll leave a busted entry in
             # asyncore.socket_map, which will prevent asyncore.loop()
             # from working correctly.
-            logging.warning( "Server couldn't bind to %s" % (
-                str((interface, port))))
+            logging.warning("%s couldn't bind to %s: %s" % (
+                    self.name(), str((interface, port)),
+                    e ))
             self.close()
             raise
 
         # If either the Map or Reduce functions are empty, direct the
         # TaskManager to skip that phase.  Since Server.reducefn and
         # .mapfn are not set at Server.__init__ time, we must defer
-        # 'til .setup is invoked, to detect if these are provided.
+        # 'til .conn() is invoked, to detect if these are provided.
         if self.reducefn is None:
             self.taskmanager.tasks = TaskManager.MAPONLY
         elif self.mapfn is None:
@@ -1356,20 +1426,6 @@ class Server(asyncore.dispatcher, object):
         mincemeat.Client.process for more details)
         """
         return process(timeout=timeout, map=self._map, schedule=self.schedule)
-
-    def finished(self):
-        """
-        Detect if finished.  If no self.taskmanager, self.datasource
-        has not been set, hence not finished.
-        """
-        return self.taskmanager \
-            and self.taskmanager.state == TaskManager.FINISHED
-
-    def results(self):
-        # Successfully completed Map/Reduce.  Return results.
-        if not self.finished():
-            return None
-        return self.taskmanager.results
 
     def handle_accept(self):
         """
@@ -1410,10 +1466,12 @@ class Server(asyncore.dispatcher, object):
 
     def handle_close(self):
         """
-        EOF (or other failure) on our socket.  We have a chance to
-        tidy up nicely.  Arrange to send an EOF on all clients by
-        using socket.shutdown(SHUT_WR) to close the outbound half of
-        all file descriptors.  This will cause them to finish up their
+        EOF (or other failure) on our socket (or just detected
+        completion).  We have a chance to tidy up nicely.
+
+        Arrange to send an EOF on all clients by using
+        socket.shutdown(SHUT_WR) to close the outbound half of all
+        file descriptors.  This will cause them to finish up their
         current command, send the result, receive EOF, and close
         nicely.  The Protocol will handle establishing deferred
         closes, if EOF doesn't flow through.
@@ -1423,13 +1481,12 @@ class Server(asyncore.dispatcher, object):
         except Exception, e:
             logging.warning("%s closing main port failed: %s" % (
                     self.name(), e))
-        if self.taskmanager:
-            for chan in self.taskmanager.channels.keys():
-                try:
-                    chan.handle_close()
-                except Exception, e:
-                    logging.warning("%s closing %s failed: %s" % ( 
-                            self.name(), chan.name(), e ))
+        for chan in self.taskmanager.channels.keys():
+            try:
+                chan.handle_close()
+            except Exception, e:
+                logging.warning("%s closing %s failed: %s" % (
+                        self.name(), chan.name(), e))
 
     def handle_expt(self):
         """
@@ -1438,32 +1495,26 @@ class Server(asyncore.dispatcher, object):
         """
         self.handle_close()
 
-    def set_datasource(self, ds):
+    def set_datasource(self, datasource=None, **kwargs):
         """
-        Setting a new datasource replaces the TaskManager.  This must
-        be done only when no Map/Reduce tasks are outstanding, because
-        the incoming responses will be supplied to the Server's
-        current TaskManager.  Unfortunately, it it is almost
-        impossible to ensure; communications to a client may be
-        nondeterministically delayed, so ancient responses may arrive
-        at any time.
-        """
-        # Create a TaskManager, or give an idle one the datasource
-        if self.taskmanager is None:
-            self.taskmanager = TaskManager(ds, self)
-        else:
-            if self.taskmanager.state != TaskManager.IDLE:
-                raise Exception("TaskManager Busy")
-            self.taskmanager.datasource = ds
+        Set (or enqueue) a Map/Reduce Transaction datasource, starting
+        the TaskManager if it is idle.  Any other keyword args are presumed
+        to be configuration parameters for the TaskManager.
 
-        # If a non-None datasource provided, START the IDLE
-        # TaskManager, and jump-start any idling channels.
-        if ds is not None:
-            if self.taskmanager.state is TaskManager.IDLE:
-                self.taskmanager.state = TaskManager.START
-                for chan, activity in self.taskmanager.channels.iteritems():
-                    if activity is None:
-                        chan.start_new_task()
+        This method (when called directly) returns the Transaction ID
+        'txn', under which this Map/Reduce Transaction will be
+        processed.  However, if used via the:
+
+            datasource = <something dict-like>
+
+        property, the return txn is inaccessible, making it difficult
+        to identify which Transaction any subsequent Result (via
+        TaskManager.result or resultfn()) matches.
+        """
+        # Queue it up, and jump-start the TaskManager's idle channels
+        kwargs.update({'datasource': datasource})
+        self.taskmanager.deque.append(kwargs)
+        self.taskmanager.jump_start()
     
     def get_datasource(self):
         return self.taskmanager and self.taskmanager.datasource or None
@@ -1546,16 +1597,16 @@ class ServerChannel(Protocol):
             self.server.taskmanager.channel_idle(self)
             logging.info("%s idle" % self.name())
             return
-        self.server.taskmanager.channel_sending(self, command, txn)
+        self.server.taskmanager.channel_sending(self, command, data, txn)
         self.send_command(command, data, txn)
 
     def map_done(self, command, data, txn):
-        self.server.taskmanager.channel_process(self, command, txn)
+        self.server.taskmanager.channel_process(self, command, data, txn)
         self.server.taskmanager.map_done(data, txn)
         self.start_new_task()
 
     def reduce_done(self, command, data, txn):
-        self.server.taskmanager.channel_process(self, command, txn)
+        self.server.taskmanager.channel_process(self, command, data, txn)
         self.server.taskmanager.reduce_done(data, txn)
         self.start_new_task()
 
@@ -1577,7 +1628,7 @@ class ServerChannel(Protocol):
         it doesn't like 'em, we're toast; consider it a protocol
         failure (by invoking original base class method).
         """
-        if self.server.unrecognized_command( command, data, txn, chan=self):
+        if self.server.unrecognized_command(command, data, txn, chan=self):
             return True
 
         return Protocol.unrecognized_command(self, command, data, txn)
@@ -1595,11 +1646,11 @@ class ServerChannel(Protocol):
         """
         logging.debug("%s -- post_auth_init" % self.name())
         if self.server.mapfn:
-            self.send_command('mapfn', self.store_func( self.server.mapfn ))
+            self.send_command('mapfn', self.store_func(self.server.mapfn))
         if self.server.reducefn:
-            self.send_command('reducefn', self.store_func( self.server.reducefn ))
+            self.send_command('reducefn', self.store_func(self.server.reducefn))
         if self.server.collectfn:
-            self.send_command('collectfn', self.store_func( self.server.collectfn ))
+            self.send_command('collectfn', self.store_func(self.server.collectfn))
         self.server.taskmanager.channel_opened(self)
         self.start_new_task()
     
@@ -1647,26 +1698,37 @@ class TaskManager(object):
     SINGLEUSE   = 0             # After finishing, close Server and 'disconnect' clients
     PERMANENT   = 1             # Go idle 'til another Map/Reduce transaction starts
 
-    txn = "0"
-    def __init__(self, datasource, server,
+    def __init__(self, server,
                  tasks=None, allocation=None, cycle=None):
-        self.datasource = datasource
+        # datasources, etc. on deque ;)  May configure contain
+        # dicts configuring:
+        # 
+        #   .datasource -- A dict-like name/corpus store
+        #   .txn        -- A transaction ID to use (None default)
+        #   .cycle      -- ONESHOT or CONTINUOUS (default)
+        #   .allocation -- PERMANENT or SINGLEUSE (default)
+        # 
+        self.defaults = {
+            'datasource':       None,
+            'txn':              None,
+            'allocation':       TaskManager.CONTINUOUS,
+            'cycle':            TaskManager.SINGLEUSE
+            }
+
+        self.deque = collections.deque()        # {'attr': value, ...}, ...
+        
         self.server = server
         self.state = TaskManager.IDLE
         self.tasks = tasks or TaskManager.MAPREDUCE
+
+        self.datasource = None                  # If None, TaskManager will idle
+        self.txn = None                         # Currently running Transaction
         self.allocation = allocation or TaskManager.CONTINUOUS
         self.cycle = cycle or TaskManager.SINGLEUSE
 
         # Track what channels exist, and were last reported as being
-        # up to { addr: (command, timetamp), ... }
+        # up to {addr: (command, timetamp), ...}
         self.channels = {}
-
-        # Each time we create another TaskManager (or an existing Task
-        # Manager moves onto a new Map/Reduce Transaction), we'll
-        # advance this.  This will enforce a new Transaction number
-        # for every possible transaction, during the possible lifespan
-        # of the python interpreter's connections to any Client
-        self.txn = str(int(self.txn) + 1)
 
 
     # 
@@ -1693,13 +1755,13 @@ class TaskManager(object):
         self.channel_log(chan, "Idle")
         self.channels[chan] = None
 
-    def channel_sending(self, chan, command, txn):
+    def channel_sending(self, chan, command, data, txn):
         if self.channels.get(chan, None):
-            self.channel_log(chan, "Done")
+            self.channel_log(chan, "Done", how="debug")
         self.channels[chan] = (txn, command, None, time.time())
-        self.channel_log(chan, "Sending")
+        self.channel_log(chan, "Sending", detail=repr.repr(data))
 
-    def channel_process(self, chan, response, txn):
+    def channel_process(self, chan, response, data, txn):
         what = "Processing"
         try:
             cmdtxn, command, __, started = self.channels[chan]
@@ -1712,9 +1774,9 @@ class TaskManager(object):
         if txn != cmdtxn:
             return
         self.channels[chan] = (cmdtxn, command, response, started)
-        self.channel_log(chan, "Processing")
+        self.channel_log(chan, "Processing", detail=repr.repr(data))
 
-    def channel_log(self, chan, what, how = "info"):
+    def channel_log(self, chan, what, detail=None, how="info"):
         if chan is None:
             # No chan; Just print header
             getattr(logging, how)("%-25s Time    State      Txn  Response  Command" % (
@@ -1722,20 +1784,59 @@ class TaskManager(object):
             return
         tpl = self.channels.get(chan, None)
         if tpl is None:
-            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%s' % (
+            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%-10s%s' % (
                     chan.name(), 0.0, what,
-                    '', '',''))
+                    '', '', '', ''))
         else:
             txn, command, response, when = tpl
-            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%s' % (
+            getattr(logging, how)('%-25s %6.3fs %-10s %-4s<%-10s>%-10s%s' % (
                     chan.name(), time.time() - when, what,
-                    txn, response and response or "", command ))
+                    txn, response and response or "", command,
+                    detail and detail or ""))
+
+    def jump_start(self):
+        """
+        Any ServerChannels that have gone idle must be manually
+        awakened, whenever there may be a new Transaction tasks
+        to process.
+        """
+        for chan, activity in self.channels.iteritems():
+            if activity is None:
+                chan.start_new_task()
 
     def next_task(self, channel):
+        """
+        Invoked by ServerChannels after they complete their current
+        Task (or after being awakened), to obtain a new one.
+
+        When TaskManager is IDLE, the first one in will check if new
+        Transactions are available on deque, and get things going.
+        """
         if self.state == TaskManager.IDLE:
-            # Initial state (no datasource, or not yet appropriate
-            # to start.  Issue any clients an idle task.
-            return (None, None, None)
+            # If nothing (or None) is left on the deque, set us back to
+            # defaults.  This will put us back into idle mode.
+            try:
+                transaction = self.deque.popleft()
+            except:
+                transaction = None
+            if transaction is None:
+                transaction = {}
+
+            for attr in self.defaults.keys():
+                value = transaction.pop(attr, self.defaults[attr])
+                logging.debug("%s TaskManager.%-10s = %s %s" % (
+                    self.server.name(), attr, value,
+                    value == self.defaults[attr] and "(default)" or ""))
+                setattr(self, attr, value)
+            if transaction:
+                logging.warning("%s unrecognized TaskManager configuration: %s " % (
+                    self.server.name(), repr.repr(transaction)))
+            if self.datasource:
+                self.state = TaskManager.START
+            else:
+                # Initial state (no datasource, or not yet appropriate
+                # to start.  Issue any clients an idle task.
+                return (None, None, None)
 
         if self.state == TaskManager.START:
             self.map_iter = iter(self.datasource)
@@ -1805,20 +1906,22 @@ class TaskManager(object):
                 # Create a finished result dictionary by applying the
                 # supplied Server.finishfn over the Reduce results.  
                 self.results \
-                    = dict( applyover(self.server.finishfn,
-                                      self.results.iteritems()))
+                    = dict(applyover(self.server.finishfn,
+                                     self.results.iteritems()))
             self.state = TaskManager.FINISHED
 
         if self.state == TaskManager.FINISHED:
-            # All done; results ready.  Invoke optional .resultfn with
-            # results.  Stop accepting new Client connections, and
-            # send a 'disconnect' to each client that asks for a new
-            # task.  TODO: For PERMANENT TaskManagers, we do NOT want
-            # to close; in fact, we can remove this (and server
-            # argument), and let the server itself decide when it
-            # should shut down.
-            if self.server.resultfn:
-                self.server.resultfn( self.results )
+            # All done; results ready.  Invoke (optionally overridden
+            # or redefined) .resultfn with results.  Stop accepting
+            # new Client connections, and send ga 'disconnect' to each
+            # client that asks for a new task.
+            self.server.resultfn(self.txn, self.results)
+
+            if self.cycle == TaskManager.PERMANENT:
+                self.state = TaskManager.IDLE
+                return self.next_task(channel)
+
+            # Done.  Kill server, disconnect any channels coming for tasks
             self.server.handle_close()
             return ('disconnect', None, self.txn)
     
@@ -1859,10 +1962,14 @@ class Mincemeat_daemon(threading.Thread):
     """
     A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
     numeric 'timeout=' keyword arg creation will cause timeout() to be
-    fired about every that many seconds.
+    fired about every that many seconds.  By default, allocates a
+    private asyncore socket map, so we can process async I/O events
+    using a separate thread from any other asyncore derived object.
 
-    Note that an overridden Thread.run method does *not* receive *args
-    or **kwargs; Only a target=... method does...
+    Note that an overridden Thread.run method does *not* receive the
+    args= or kwargs= passed to threading.Thread.__init__; Only a
+    target=... method does.  This appears to be a defect (or at least
+    a documentation oversight).
 
     Raises exception on the Server's failure to bind, or a Client's
     failure to connect.
@@ -1888,9 +1995,12 @@ class Mincemeat_daemon(threading.Thread):
         if schedule is None:
             schedule = collections.deque()
         self.mincemeat = cls(map=map, schedule=schedule, shuttout=shuttout)
-
+        if not hasattr(self.mincemeat, '_map'):
+            raise AttributeError("%s requires a cls=... object be derived from asyncore.dispatcher"
+                                  % (self.__class__))
+        logging.debug("%s using asyncore socket map: %s" % (
+            self.mincemeat.name(), repr.repr(self.mincemeat._map)))
         self.mincemeat.conn(asynchronous=True, **credentials)
-
 
     def name(self):
         return self.mincemeat.name()
@@ -1926,8 +2036,9 @@ class Mincemeat_daemon(threading.Thread):
             logging.info("%s failed: %s" % (self.name(), e))
             self._state = "failed: %s" % e
         else:
-            # Normal exit; if finished(), assume success
-            if self.mincemeat.finished():
+            # Normal thread exit; if finished() and authenticated(),
+            # assume success
+            if self.mincemeat.finished() and self.mincemeat.authenticated():
                 self._state = "success"
             else:
                 self._state = "failed: incomplete"
@@ -1966,6 +2077,10 @@ class Mincemeat_daemon(threading.Thread):
 class Client_daemon(Mincemeat_daemon):
     """
     Start a mincemeat.Client (by default), as a daemon.
+
+    Defaults to use its own asyncore socket map; set map=<dict> to use
+    a common map (and one thread) to active multiple objects derived
+    from asyncore.dispatcher or asynchat.async_chat.
     """
     def __init__(self, credentials, cls=Client,
                  map=None, schedule=None, shuttout=.5,
@@ -1997,7 +2112,7 @@ def run_client():
 
     client = Client()
     client.password = options.password
-    client.conn( len(args) > 0 and args[0] or "", options.port)
+    client.conn(len(args) > 0 and args[0] or "", options.port)
 
 if __name__ == '__main__':
     run_client()

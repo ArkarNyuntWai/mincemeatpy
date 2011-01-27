@@ -10,9 +10,12 @@ import errno
 import asyncore
 import threading
 import time
+import timeit
 import traceback
 import select
 import sys
+
+timer = timeit.default_timer # Platform-specific high-precision wall-clock timer
 
 """
 example-sf-repl         -- Client reads/schedules requests; Spawns Server if needed
@@ -111,9 +114,9 @@ def sum_values_generator( kvi ):
 # for each Map data_key:
 # 
 # mapfn( source_key, data )
-#   --> { map_key1: [ value, ...] ), map_key2: [ value, ...], ... }
-# collectfn( map_key1, [ value, value ] )
-#   --> data_key1: [ value ]
+#   --> {map_key1: [value, ...] ), map_key2: [value, ...], ...}
+# collectfn( map_key1, [value, value] )
+#   --> data_key1: [value]
 # 
 #     The optional collectfn would be appropriate to (for example)
 # reduce the communication payload size (eg. store the map data in
@@ -194,17 +197,19 @@ finishfn = sum_values
 # 
 # Result Callback
 # 
-#     Instead of monitoring the Server for completion, an optional
+#     Invoked with the Map/Reduce Transaction ID and its results.
+# 
+#     Instead of monitoring the Server for completion and manually
+# obtaining results via the Server.results() function, an optional
 # resultfn callback may be provided, which is invoked by the Server
 # immediately with the final results upon completion.
 # 
-
 global_results = collections.deque()
 
-def store_results(results):
-    global_results.append( results )
+def store_results(txn, results):
+    global_results.append((txn, results))
 
-def server_results(results, top=None):
+def server_results(txn, results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
 
@@ -232,11 +237,9 @@ def server_results(results, top=None):
                             reversed(bycountlist)):
         print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
 
-#resultfn = None
+#resultfn = None                # Access results manually
 #resultfn = server_results      # Process directly (using asyncore.loop thread)
-resultfn = store_results        # Store for processing later
-
-
+resultfn = store_results        # Store for processing later by another thread
 
 credentials = {
     'password':         'changeme',
@@ -248,7 +251,8 @@ credentials = {
     'collectfn':        collectfn,
     'reducefn':         reducefn,
     'finishfn':         finishfn,
-    'resultfn':         resultfn,
+    # We'll provide a resultfn in our Server_Repl class...
+    #'resultfn':         resultfn
 }
     
 def logchange( who, previous ):
@@ -342,8 +346,13 @@ class Client_Repl(mincemeat.Client):
         """
         Store the results; let the main thread detect and print new results.
         """
+        logging.info("%s received command: %s %s" % (
+                self.name(), 
+                '/'.join( [command] + ( txn and [txn] or [])),
+                repr.repr(data)))
+
         if command == "transactiondone":
-            store_results( data )
+            store_results(txn, data)
             return True
 
         return False
@@ -372,9 +381,13 @@ class Server_Repl(mincemeat.Server):
 
     We'll enqueue deque of tasks, where we'll remember the issuing
     ServerChannel, and the (command, data, txn) tuple.  Later, after
-    the transaction is complete, we'll send back a "transactiondone".
-    
+    the transaction is complete, we'll send back a "transactiondone"
+    via the same channel to the Client.
     """
+    def __init__(self, *args, **kwargs):
+        mincemeat.Server.__init__(self, *args, **kwargs)
+        self.loctxn = 1000
+        self.inflight = {}
 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
@@ -384,56 +397,86 @@ class Server_Repl(mincemeat.Server):
 
         The local Map/Reduce transaction performed by our TaskManager
         will generate its own 'txn', independent of this one created
-        by the Client.
+        by the Client.  We'll map our txn back to the client's when
+        returning the results.
         """
         logging.info("%s received command via %s from peer %s: %s %s" % (
                 self.name(), chan.name(), str(chan.addr), 
-                '/'.join( [command] + ( txn and [txn] or [])), repr.repr(data)))
+                '/'.join( [command] + ( txn and [txn] or [])),
+                repr.repr(data)))
 
         if command == "transaction":
             path = os.path.join( "../Gutenberg SF CD/Gutenberg SF",
                                  str(data))
-            logging.info("%s Map/Reduce Transaction: %s" % (
-                    self.name, path))
-            self.datasource = file_contents( path )
+            data = file_contents( path )
+            logging.info("%s Map/Reduce Transaction: %s ==> %d files" % (
+                    self.name(), path, len(data)))
 
-            #self.datasource = transactions.append( (command, data, txn, chan) )
+            loctxn = str(self.loctxn)
+            self.loctxn += 1
+            self.set_datasource(
+                datasource      = data,
+                txn             = loctxn,
+                allocation      = mincemeat.TaskManager.CONTINUOUS,
+                cycle           = mincemeat.TaskManager.PERMANENT )
+
+            self.inflight.update({loctxn: {
+                'txn':          txn,
+                'chan':         chan,
+                }})
             return True
 
         return False
 
-    def resultfn(self, results, txn):
+    def resultfn(self, txn, results):
         """
-        Trap the result, and send them back.
+        Retrieve the channel and the Client's txn information using
+        our Map/Reduce Transaction's txn, and send the results back to
+        the Client.
         """
-        logging.info("%s computed results: %s" (repr.repr( results )))
-
+        client = self.inflight.pop(txn, None)
+        if client:
+            logging.warning("%s sending txn %s results back via %s" % (
+                    self.name(), txn, client['chan'].name()))
+            client['chan'].send_command( "transactiondone", data=results,
+                                         txn=client['txn'] )
+        else:
+            logging.warning("%s unable to identify txn %s results: %s" % (
+                    self.name(), txn, repr.repr( results )))
 
 
 def REPL( cli ):
     """
-    Await input from client.  Since Windows (unbelievably) cannot
-    await async I/O on both a socket and the console, we must use a
-    separate thread...  A blank line will terminate input.
+    Await input from console, and send it to the Server, via the
+    Client.
+
+    Since Windows (unbelievably) cannot await async I/O on both a
+    socket and the console, we must use a separate thread...  A blank
+    line will terminate input.
     """
-    command = 0
+    txn = 0
     print "Which files?  eg. '*.txt<enter>'"
     while cli.is_alive():
         print "GLOB> ",
-        try:    inp = sys.stdin.readline().rstrip()
-        except: inp = None
+        try:
+            inp = sys.stdin.readline().rstrip()
+        except:
+            inp = None
         if inp:
-            cli.mincemeat.send_command_backchannel( "transaction", inp,
-                                                    txn = str( command ))
+            cli.mincemeat.send_command_backchannel("transaction", inp,
+                                                    txn=str(txn))
         else:
+            # EOF or newline
             break
-        command += 1
+        txn += 1
 
+        # Wait for results to appear, or client to die.
         while cli.is_alive() and not global_results:
-            print ".",
-            time.sleep( 1 )
+            time.sleep(.25)
+
         if global_results:
-            server_results( global_results.popleft(), top=100 )
+            args = global_results.popleft()
+            server_results(top=100, *args)
     
 
 def main():
@@ -448,10 +491,10 @@ def main():
         # know how long this might take (including authentication), we
         # may need to attempt creating a Client or a Server several
         # times.
-        begun = time.clock()
+        begun = timer()
         limit = 5.0                     # Wait for this time, total
-        cycle = 0.1                     # Wait about this long per cycle
-        while time.clock() < begun + limit:
+        cycle = 0.5                     # Wait about this long per cycle
+        while timer() < begun + limit:
             if not cli:
                 # No client yet? Create one.  May sometimes throw
                 # immediately, if non-blocking connect is unusually
@@ -502,12 +545,10 @@ def main():
                     svr = None
 
 
-
         # We've given the the 'ol college try, to start a Client;
         # ensure we have had a Client!  If so, wait 'til it is done.
         # If we (also) ran a Server_thread, it'll use the 'resultfn'
         # callback to deliver the results.
-
         if not cli or cli.state() != "authenticated":
             raise Exception("Client couldn't authenticate with Server")
 
@@ -527,9 +568,11 @@ def main():
             time.sleep( 1 )
 
     except KeyboardInterrupt:
-        logging.info("Manual shutdown requested")
+        logging.info("%s Manual shutdown requested" % (
+                svr and svr.name() or "" ))
     except Exception, e:
-        logging.error("Exception encountered: %s\n%s" % (
+        logging.error("%s Exception encountered: %s\n%s" % (
+                svr and svr.name() or "",
                 e, traceback.format_exc()))
     finally:
         # Exception, Manual shutdown (eg. KeyboardInterrupt), or
@@ -555,6 +598,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.INFO )
+    logging.basicConfig( level=logging.WARNING )
     sys.exit(main())
-

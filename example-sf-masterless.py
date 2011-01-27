@@ -11,7 +11,7 @@ import time
 import sys
 
 """
-example-sf-masterless	-- elect a server, become a client, schedule requests
+example-sf-masterless   -- elect a server, become a client, schedule requests
 
     To run this test, simply start an instances of this script:
 
@@ -89,14 +89,14 @@ def get_lower_simple( k, v ):
 # 
 def sum_values( k, vs ):
     try:
-        return sum( vs )		# Will throw unless vs is iterable, summable
+        return sum( vs )                # Will throw unless vs is iterable, summable
     except TypeError:
         return vs
 
 def sum_values_generator( kvi ):
     for k, vs in kvi:
         try:
-            yield k, sum( vs )		# Will throw unless vs is iterable, summable
+            yield k, sum( vs )          # Will throw unless vs is iterable, summable
         except TypeError:
             yield k, vs
 
@@ -188,9 +188,9 @@ finishfn = sum_values
 #finishfn = sum_values_generator
 
 addr_info = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT,
+    'password':         'changeme',
+    'interface':        'localhost',
+    'port':             mincemeat.DEFAULT_PORT,
 }
     
 

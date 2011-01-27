@@ -12,7 +12,7 @@ import traceback
 import sys
 
 """
-example-sf-daemon	-- elect a server, become a client, issue requests
+example-sf-daemon       -- elect a server, become a client, issue requests
 
     To run this test, simply start an instances of this script:
 
@@ -41,7 +41,7 @@ class file_contents(object):
             f.close()
 
 # Obtain CD ISO from: http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
-datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
+datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*18*.txt' )
 
 # 
 # Map Functions.
@@ -87,14 +87,14 @@ def get_lower_simple( k, v ):
 # 
 def sum_values( k, vs ):
     try:
-        return sum( vs )		# Will throw unless vs is iterable, summable
+        return sum( vs )                # Will throw unless vs is iterable, summable
     except TypeError:
         return vs
 
 def sum_values_generator( kvi ):
     for k, vs in kvi:
         try:
-            yield k, sum( vs )		# Will throw unless vs is iterable, summable
+            yield k, sum( vs )          # Will throw unless vs is iterable, summable
         except TypeError:
             yield k, vs
 
@@ -196,10 +196,10 @@ finishfn = sum_values
 
 global_results = []
 
-def store_results(results):
-    global_results.append( results )
+def store_results(txn, results):
+    global_results.append((txn, results))
 
-def server_results(results):
+def server_results(txn, results):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
     bycount = {}
@@ -218,22 +218,22 @@ def server_results(results):
         print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
 
 #resultfn = None
-#resultfn = server_results	# Process directly (using asyncore.loop thread)
-resultfn = store_results	# Store for processing later
+#resultfn = server_results      # Process directly (using asyncore.loop thread)
+resultfn = store_results        # Store for processing later
 
 
 
 credentials = {
-    'password': 	'changeme',
-    'interface':	'localhost',
-    'port': 		mincemeat.DEFAULT_PORT,
+    'password':         'changeme',
+    'interface':        'localhost',
+    'port':             mincemeat.DEFAULT_PORT,
 
-    'datasource': 	datasource,
-    'mapfn':		mapfn,
-    'collectfn':	collectfn,
-    'reducefn':		reducefn,
-    'finishfn':		finishfn,
-    'resultfn':		resultfn,
+    'datasource':       datasource,
+    'mapfn':            mapfn,
+    'collectfn':        collectfn,
+    'reducefn':         reducefn,
+    'finishfn':         finishfn,
+    'resultfn':         resultfn,
 }
     
 def logchange( who, previous ):
@@ -288,8 +288,8 @@ def main():
         # may need to attempt creating a Client or a Server several
         # times.
         begun = time.clock()
-        limit = 5.0			# Wait for this time, total
-        cycle = 0.1			# Wait about this long per cycle
+        limit = 5.0                     # Wait for this time, total
+        cycle = 0.1                     # Wait about this long per cycle
         while time.clock() < begun + limit:
             if not cli:
                 # No client yet? Create one.  May sometimes throw
@@ -361,15 +361,15 @@ def main():
                 begun = time.clock()
                 cli.mincemeat.send_command_backchannel(
                     "ping", ( "Request from %s" % ( socket.getfqdn()),
-                               #'x' * 1 * 1000 * 1000 ))	# a big blob...
-                              "%s -- main thread" % (		# a thread name
+                               #'x' * 1 * 1000 * 1000 ))        # a big blob...
+                              "%s -- main thread" % (           # a thread name
                                   threading.current_thread().name )))
                 time.sleep( 5 )
 
             # Done! Client has exited.  Log any results available, if
             # we were running Server
             while global_results:
-                server_results( global_results[0] )
+                server_results( *global_results[0] )
                 del global_results[0]
 
 
@@ -397,6 +397,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.DEBUG )
+    logging.basicConfig( level=logging.INFO )
     sys.exit(main())
-
