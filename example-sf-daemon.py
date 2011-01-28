@@ -12,15 +12,16 @@ import traceback
 import sys
 
 """
-example-sf-daemon       -- elect a server, become a client, issue requests
+example-sf-daemon       -- elect a server, become a client; uses daemons
 
     To run this test, simply start an instances of this script:
 
         python example-sf-daemon.py
 
-Each client may schedule Map-Reduce  for the server, and receive
-the results of those tasks sometime in the future.  Of course, each
-client also receives map and reduce tasks from the server.
+Much like example-sf-masterless.py, but uses the
+mincemeat.Server_daemon and Client_daemon to implement threaded async
+I/O.  Also demonstrates advanced usage of the default Server.output
+deque, for asynchronously accessing Map/Reduce results.
 """
 
 class file_contents(object):
@@ -193,35 +194,35 @@ finishfn = sum_values
 # resultfn callback may be provided, which is invoked by the Server
 # immediately with the final results upon completion.
 # 
-
-global_results = []
-
-def store_results(txn, results):
-    global_results.append((txn, results))
-
-def server_results(txn, results):
+def server_results(txn, results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
+    print "Transaction %s; %s%d results:" % (
+        txn, ( top and "top %d of " % top or ""), len(results))
+    # Collect lists of all words with each unique count
     bycount = {}
-    for k,v in results.items():
-        if v in bycount:
-            bycount[v].append(k)
+    for wrd,cnt in results.items():
+        if cnt in bycount:
+            bycount[cnt].append(wrd)
         else:
-            bycount[v] = [k]
-    
+            bycount[cnt] = [wrd]
+
+    # Create linear list of words sorted by count (limit to top #)
     bycountlist = []
-    for k,l in sorted(bycount.items()):
-        for w in sorted(l):
-            bycountlist.append((k, w))
-    
-    for k, lt in zip(sorted(results.keys()), bycountlist):
-        print "%8d %-40.40s %8d %s" % (results[k], k, lt[0], lt[1])
+    for cnt in sorted(bycount.keys(), reverse=True):
+        for wrd in sorted(bycount[cnt]):
+            bycountlist.append((cnt, wrd))
+        if top and len(bycountlist) >= top:
+            break
 
-#resultfn = None
-#resultfn = server_results      # Process directly (using asyncore.loop thread)
-resultfn = store_results        # Store for processing later
+    # Print two columns; one sorted lexicographically, one by count
+    for wrd, cnt_wrd in zip(sorted([wrd for __,wrd in bycountlist],
+                                   reverse=True),
+                            reversed(bycountlist)):
+        print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
 
-
+resultfn = None                 # None retains default behaviour
+#resultfn = server_results       # Process directly (using asyncore.loop thread)
 
 credentials = {
     'password':         'changeme',
@@ -364,13 +365,15 @@ def main():
                                #'x' * 1 * 1000 * 1000 ))        # a big blob...
                               "%s -- main thread" % (           # a thread name
                                   threading.current_thread().name )))
-                time.sleep( 5 )
+                time.sleep( 1 )
 
             # Done! Client has exited.  Log any results available, if
-            # we were running Server
-            while global_results:
-                server_results( *global_results[0] )
-                del global_results[0]
+            # we were running Server.  We'll access the
+            # mincemeat.Server.output deque directly, and pass the
+            # (txn,results) tuple as position args.
+            while svr.mincemeat.output:
+                args = svr.mincemeat.output.popleft()
+                server_results(top=100, *args)
 
 
     except KeyboardInterrupt:

@@ -212,7 +212,8 @@ def store_results(txn, results):
 def server_results(txn, results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
-
+    print "Transaction %s; %s%d results:" % (
+        txn, ( top and "top %d of " % top or ""), len(results))
     # Collect lists of all words with each unique count
     bycount = {}
     for wrd,cnt in results.items():
@@ -235,9 +236,10 @@ def server_results(txn, results, top=None):
                             reversed(bycountlist)):
         print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
 
-#resultfn = None                # Access results manually
-#resultfn = server_results      # Process directly (using asyncore.loop thread)
-resultfn = store_results        # Store for processing later by another thread
+# We'll provide a resultfn in our Server_Repl class...
+resultfn = None                 # None retains default behaviour
+#resultfn = server_results       # Process directly (using asyncore.loop thread)
+#resultfn = store_results        # Store for processing later by another thread
 
 credentials = {
     'password':         'changeme',
@@ -249,8 +251,7 @@ credentials = {
     'collectfn':        collectfn,
     'reducefn':         reducefn,
     'finishfn':         finishfn,
-    # We'll provide a resultfn in our Server_Repl class...
-    #'resultfn':         resultfn
+    'resultfn':         resultfn
 }
     
 def logchange( who, previous ):
@@ -608,5 +609,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.WARNING )
+    logging.basicConfig( level=logging.INFO )
     sys.exit(main())

@@ -74,7 +74,11 @@ control over the lifespan of the instances (eg. a web server farm,
     python example-sf-masterless.py
 
 This will run a client and a server!  To speed it up, create more
-clients by running the same command.
+clients by running the same command.  Another implementation with
+similar functionality, but using a better threading based daemon
+implementation for the Client and Server is:
+
+    python example-sf-daemon.py
 
 
 * Client-driven REPL for submitting Map/Reduce tasks
