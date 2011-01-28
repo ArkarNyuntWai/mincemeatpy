@@ -11,7 +11,7 @@ import time
 import sys
 
 """
-example-sf-masterless   -- elect a server, become a client, schedule requests
+example-sf-masterless   -- elect a server, become a client
 
     To run this test, simply start an instances of this script:
 

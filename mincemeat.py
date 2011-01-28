@@ -139,7 +139,7 @@ def process(timeout=None, map=None, schedule=None):
     """
     try:
         if map is None:
-            map = asyncore.socket_map           # Internal asyncore knowledg!
+            map = asyncore.socket_map           # Internal asyncore knowledge!
 
         beg = now = timer()
         dur = 0.0
@@ -189,21 +189,29 @@ def process(timeout=None, map=None, schedule=None):
                 rem = min(rem)
             else:
                 rem = None
+            #logging.debug("asyncore.loop map %s, dur: %f, rem: %f, timeout: %s" % (
+            #        repr.repr(map), dur, rem, timeout))
+
             asyncore.loop(timeout=rem, map=map, count=1)
             now = timer()
             dur = now - beg
 
-    except:
+    except Exception, e:
         # We're no longer running asyncore.loop, so can't do anything
         # cleanly; just close 'em all...  This should ensure that any
         # socket resources associated with this object get cleaned up.
         # In order to ensure that the original error context gets
         # raised, even if the asyncore.close_all fails, we must use
         # re-raise inside a try-finally.
+        #logging.debug("asyncore.loop exception map %s: %s" % (
+        #        repr.repr(map), e ))
         try:
             raise
         finally:
             close_all(map=map, ignore_all=True)
+
+    #logging.debug("asyncore.loop map %s done: %s" % (
+    #        repr.repr(map), bool(map)))
 
     # True iff map isn't empty
     return bool(map)
@@ -1232,7 +1240,8 @@ class Server(asyncore.dispatcher, object):
 
     def resultfn(self, txn, results):
         """
-        By default, just collect up the results in self.output.
+        By default, just collect up the results in the self.output
+        deque.
 
         This may be overridden in a derived class:
 
@@ -1287,7 +1296,7 @@ class Server(asyncore.dispatcher, object):
         this will probably just always return None.
         """
         if not bool(self.output):
-            # No output available.  Return nothing.
+            # No output produced.  Return nothing.
             return None
         txn, results = self.output.popleft()
         return results
@@ -1366,7 +1375,10 @@ class Server(asyncore.dispatcher, object):
         This will allow exactly one Server bound to a specific port to
         accept incoming Client connections.  Any additional keyword
         args are assumed to be (optional) values for Server attributes
-        (eg. .datasource, .mapfn, ...)
+        (eg. .datasource, .mapfn, ...)  Any values passed are only
+        used if they are non-None; in other words, a None value will
+        not override a valid default value (such as for resultfn,
+        where the default behavior saves the results for later access!
 
         If asynchronous, then we will not initiate processing; it is
         the caller's responsibility to do so; every Client and/or
@@ -1375,9 +1387,15 @@ class Server(asyncore.dispatcher, object):
 
         The default behaviour of bind when interface == '' is pretty
         consistently to bind to all available interfaces.
+
+        We'll set self.addr early (it is set in asyncore.bind), for
+        logging purposes.
         """
+        addr = (interface, port)
+        self.addr = addr
+
         for k, v in kwargs.iteritems():
-            if hasattr(self,k):
+            if v is not None and hasattr(self,k):
                 if getattr(self,k) is None:
                     logging.info("%s conn setting %s = %s" % (self.name(), k, v))
                 else:
@@ -1387,7 +1405,8 @@ class Server(asyncore.dispatcher, object):
             else:
                 logging.debug("%s conn ignores %s = %s" % (self.name(), k, v))
         self.password = password
-        logging.debug("Server port opening.")
+        
+        logging.debug("%s listening port binding..." % self.name())
         try:
             self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
             if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
@@ -1395,7 +1414,18 @@ class Server(asyncore.dispatcher, object):
                 # are broken).  See http://goo.gl/J89cr
                 self.socket.setsockopt(socket.SOL_SOCKET,
                                         socket.SO_EXCLUSIVEADDRUSE, 1)
-            self.bind((interface, port))
+            else:
+                # Posix platform.  See http://goo.gl/LBqSS,
+                # http://goo.gl/lzD8Q We want to set SO_REUSEADDR, to
+                # allow multiple servers to bind() (even if the
+                # address endpoint is still in the TIME_WAIT state)
+                # This will NOT allow multiple parties to
+                # simultaneously bind() and listen() for incoming
+                # TCP/IP connections, if the address is in the Unicast
+                # range; Multicast addresses will allow it (sometimes
+                # also requiring SO_REUSEPORT)
+                self.set_reuse_addr()
+            self.bind(addr)
             self.listen(5)
         except Exception, e:
             # If anything fails during socket creation, we need to
@@ -1478,6 +1508,7 @@ class Server(asyncore.dispatcher, object):
         nicely.  The Protocol will handle establishing deferred
         closes, if EOF doesn't flow through.
         """
+        logging.debug("%s listening port closing." % self.name())
         try:
             self.close()
         except Exception, e:
@@ -1852,7 +1883,7 @@ class TaskManager(object):
                 # key/value pairs straight to the Reduce phase.
                 self.reduce_iter = self.map_iter
                 self.working_reduces = {}
-                self.result = {}
+                self.results = {}
                 self.stats = TaskManager.REDUCING
                 logging.debug('Server Reducing (skipping Map)')
             else:
@@ -1980,7 +2011,7 @@ class Mincemeat_daemon(threading.Thread):
 
     After start(), processes 'til the processing loop completes, and
     enters "success" state; if an exception terminates processing,
-    enters a "failure: ..." state.
+    enters a "failed: ..." state.
     """
     def __init__(self, credentials=None, cls=None,
                  map=None, schedule=None, shuttout=.5,
@@ -2056,7 +2087,8 @@ class Mincemeat_daemon(threading.Thread):
         desired.  It is invoked with done=True when the event loop
         detects completion.
         """
-        pass
+        logging.debug("%s timeout; processing %d sockets: " % (
+                self.name(), len(self._map), repr.repr(self._map)))
 
     def stop(self, timeout=5.):
         """
