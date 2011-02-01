@@ -1085,8 +1085,6 @@ class Client(Protocol):
         handle either simple functions operating on each individual
         (key,[value,...])  item, or generators which operate over the
         sequence of all items (and hence may employ remembered state).
-
-        Note that if command contains a 
         """
         logging.info("%s Mapping %s" % (self.name(), repr.repr(data[0])))
         results = {}
@@ -1103,8 +1101,10 @@ class Client(Protocol):
             # Use the generator expression, and create a new results
             # dict.  We don't simply update the results in place,
             # because the collectfn may choose to alter the keys
-            # (eg. discarding invalid keys, adding new keys).
-            results = dict((k, [v]) for k, v in rgen)
+            # (eg. discarding invalid keys, adding new keys).  Allow
+            # collectfn to yield (k, [v]) or simple (k, v), but always
+            # return keys mapped to lists.
+            results = dict((k, v if isinstance(v, list) else [v]) for k, v in rgen)
 
         self.send_command('mapdone', (data[0], results), txn)
 
@@ -1875,6 +1875,7 @@ class TaskManager(object):
 
         if self.state == TaskManager.START:
             self.map_iter = iter(self.datasource)
+            self.busy_chans = set()
             self.working_maps = {}
             self.map_results = {}
             self.state = TaskManager.MAPPING
@@ -1882,6 +1883,7 @@ class TaskManager(object):
                 # If Reduce only, skip the Map phase, passing source
                 # key/value pairs straight to the Reduce phase.
                 self.reduce_iter = self.map_iter
+                self.busy_chans = set()
                 self.working_reduces = {}
                 self.results = {}
                 self.stats = TaskManager.REDUCING
@@ -1891,6 +1893,23 @@ class TaskManager(object):
 
         if self.state == TaskManager.MAPPING:
             try:
+                # for ONESHOT allocation, we in-progress Map tasks by
+                # channel, too; as soon as each channel has had one
+                # task allocation, we are done!  We need to be careful
+                # to be sensitive to a channel disappearing; if all
+                # other channels are done their assigned Map task and
+                # are idle, and a channel dies and is closed, we need
+                # to jump-start one of the other channels and fire its
+                # start_new_task, to get the thread back in there to
+                # advance our TaskManager state...
+                if self.allocation == self.ONESHOT:
+                    if channel in self.busy_chans:
+                        # OK, we've already seen this channel... Done?
+                        if self.busy_chans.issuperset(self.channels.keys()):
+                            # Yup; all currently living channels have been seen
+                            # TODO: if a chan dies, we need to forget it's
+                            # working on a task...  How?
+                            raise StopIteration
                 map_key = self.map_iter.next()
                 map_item = map_key, self.datasource[map_key]
                 self.working_maps[map_item[0]] = map_item[1]
@@ -1933,8 +1952,8 @@ class TaskManager(object):
                 self.state = TaskManager.FINISHING
 
         if self.state == TaskManager.FINISHING:
-            # Map/Reduce Task done.` If .finishfn supplied, support
-            # either .finishfn(iterator), or .finishfn(key,value),
+            # Map/Reduce Task done.  If .finishfn supplied, support
+            # either .finishfn(iterator), or .finishfn(key,values),
             # apply it -- the resultant values are assumed to be
             # finished results, and are NOT encapsulated as a list.
             if self.server.finishfn:

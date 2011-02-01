@@ -2,6 +2,7 @@
 import mincemeat
 import collections
 import glob
+import itertools
 import logging
 import os
 import repr
@@ -28,27 +29,111 @@ Each client may schedule Map-Reduce transactions to the Server, and
 receive the results of those transactions sometime in the future.  Of
 course, each Client also receives map and reduce tasks from the
 Server.
+
+    The default location of the files referenced for pattern matching is:
+in:
+        ../Gutenberg SF CD/Gutenberg SF/
+
+Obtain CD ISO from:
+
+        http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
+
+unzip it, create the following directory, and copy the CD's "Gutenberg
+SF" directory into it:
+
+         ../Gutenberg SF CD/
+
+    Or, point 'textbase' (below) to some other directory where you
+have some handy ASCII text data files:
 """
 
-class file_contents(object):
-    def __init__(self, pattern ):
-        self.text_files = glob.glob( pattern )
+textbase = "../Gutenberg SF CD/Gutenberg SF"
 
+# 
+# Data Source.
+# 
+#     Provide key-index data for the Map/Reduce.  Typically a dict,
+# but any object satisfying the following requirements may be used.
+# Mincemeat requires unique keys (it uses them in some internal
+# record-keeping), but has no requirements on keys beyond that.  Each
+# (key, data) is passed to a Client as a Map task.
+# 
+#     Requires a dict-like object, where each key must uniquely index
+# a datum.  We require that the datasource satisfy the iterator
+# protocol (provide __iter__(), which returns an iterable object
+# having a next() returning unique keys), and at least the
+# __getitem__() method of the sequence protocol (len() is never used
+# on a datasource, so __len__() is optional)
+# 
+class file_contents(object):
+    """
+    For each filename matching the given pattern, iter(self) returns a
+    matching filename.  When indexed with a valid filename, returns
+    the file contents.
+    """
+    def __init__(self, pattern):
+        self.text_files = glob.glob( pattern )
     def __len__(self):
         return len(self.text_files)
-
     def __iter__(self):
         return iter(self.text_files)
-
     def __getitem__(self, key):
-        f = open(key)
-        try:
+        if key not in self.text_files:
+            raise IndexError
+        with open(key) as f:
             return f.read()
-        finally:
-            f.close()
 
-# Obtain CD ISO from: http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
-datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
+class file_meta(object):
+    """
+    For each filename matching the given pattern, iter(self)
+    repeatedly returns the command you specified, prefixed with an
+    index number "#@".  When indexed with (any key), returns the file
+    name.  We use this to produce:
+
+        ("#@command", "some/file/path")
+
+    for the Map phase, when using our augmented get_lower_split:
+    """
+    def __init__(self, pattern, command):
+        self.text_files = glob.glob( pattern )
+        self.command = command
+    def __len__(self):
+        return len(self.text_files)
+    def __iter__(self):
+        """
+        Return a generator producing "##@command", sufficient to index
+        each self.text_file.
+        """
+        return ("%d@%s" % (i, self.command) for i in xrange(len(self)))
+    def __getitem__(self, key):
+        """
+        Index by # portion of "#@..." key.
+        """
+        off = key.find('@')
+        if off < 1:
+            raise IndexError
+        return self.text_files[int(key[0:off])]
+
+class repeat_command(object):
+    """
+    Simply repeat the given command as the key; data is always empty.
+    We don't implement the full sequence protocol (we don't know our
+    length, so provide no __len__()), but that's OK; len() is never
+    used.
+    
+    If the default limit=None is used, then this object should be used
+    as a datasource only if TaskManager.ONESHOT is specified (send one
+    Map task to each Client).
+    """
+    def __init__(self, command, data="", limit=None):
+        self.command = command
+        self.data = data
+        self.limit = limit
+    def __iter__(self):
+        return ("%d@%s" % (idx, cmd) for idx, cmd in
+                enumerate(itertools.repeat(self.command, self.limit)))
+    def __getitem__(self, key):
+        return self.data
 
 # 
 # Map Functions.
@@ -57,8 +142,62 @@ datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
 # (key,value) pairs.
 # 
 def get_lower_split( name, corpus ):
+    """
+    Accepts the name, corpus pair and runs a word count over it. 
+
+    Alternatively, accept a name of the form "##@command", paired with
+    some data, and evals the command portion.  Executes the result as
+    a function, on the provided data.  If the result is an iterable
+    producing (key, value) pairs, yields the results directly.
+    Otherwise, processes the results as the word-count corpus.
+
+
+    """
+    import re
     import string
-    logging.debug( "Corpus: %-40s: %d bytes" %( name, len( corpus )))
+
+    m = re.match(r"^(\d*)@(.*)$", name)
+    if m:
+        # We found an '#@...' (possibly with no #); Allow arbitrary
+        # anonymous functions to be evaluated; It's OK; Server is
+        # authenticated!
+        #
+        # We expect the code to evaluate to a function taking the
+        # corpus, and returning either a new corpus, or an iterable
+        # yielding (key, value).  For example, to open and read the
+        # file locally (instead of reading it at the Server, and
+        # transmitting it:
+        # 
+        #     123@lambda corpus: open(corpus).read()
+        # 
+        # To perform a (simpler) word count directly on the named
+        # corpus file:
+        # 
+        #     123@lambda corpus: ((word.lower(), 1) for word in open(corpus).read().split())
+        # 
+        # Or, to do something else entirely (assuming the code
+        # evaluated uses names that can be resolved in the context of
+        # the Client). For example, make up keys using enumerate (all
+        # Clients must agree on the keys!), and return arbitrary lists
+        # of data:
+        # 
+        #     @lambda corpus: enumerate( [ (socket.getfqdn(), os.name) ] )
+        # 
+        logging.info( "Evaluating: %-40s: %8d bytes: %s" %(
+                name, len( corpus ), repr.repr( corpus )))
+        output = eval( m.group(2) )( corpus )
+        try:
+            for k, v in output:
+                yield k, v
+            raise StopIteration
+        except ValueError:
+            # The result was NOT a (key, value) iterator!  Continue to
+            # process it as the text corpus.
+            corpus = output
+            pass
+
+    logging.info( "Processing: %-40s: %8d bytes: %s" %(
+                name, len( corpus ), repr.repr( corpus )))
     for line in corpus.split("\n"):
         for word in line.replace('--',' ').split():
             word = word.lower().strip(string.punctuation+
@@ -70,11 +209,12 @@ def get_lower_split( name, corpus ):
                         word = word[:-len( suffix )]
             if word:
                 yield word, 1
-
+    raise StopIteration
 
 def get_lower_simple( k, v ):
     for w in v.split():
         yield w.lower(), 1
+
 
 # 
 # Collect, Reduce, or Finish Functions.
@@ -151,10 +291,25 @@ mapfn = get_lower_split
 # differences in the results of the map (dramatically smaller returned
 # lists)
 
-#collectfn = None
-collectfn = sum_values
-#collectfn = sum_values_generator
+def sum_values_long( kvi ):
+    """
+    This collectfn just sums long lists, leaving shorter ones alone.
+    It is usable only as a collectfn, but not as a reducefn/finishfn.
 
+    The collectfn may also allows returning lists (unlike
+    reducfn/finishfn).  This is because the Map[/Collect] phase always
+    takes (arbitrary) name,data as input and results in
+    {key:[value,...],...}.  The Reduce[/Finish] phase takes
+    key,[value,...] as input and results in {key:value, ...}; no lists
+    are allowed in Reduce results.  
+    """
+    for k, vs in kvi:
+        yield k, vs if len(vs) < 10 else [sum(vs)]
+
+#collectfn = None
+#collectfn = sum_values
+#collectfn = sum_values_generator
+collectfn = sum_values_long
 
 # 
 # Reduce Phase
@@ -235,6 +390,13 @@ def server_results(txn, results, top=None):
                                    reverse=True),
                             reversed(bycountlist)):
         print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
+
+def print_stats(txn, results):
+    # Collection of Stats from all Clients complete.
+    print "Stats %s; %d results:" % (
+        txn, len(results))
+    for k, v in results.iteritems():
+        print "%-16s: %s" % (k, v)
 
 # We'll provide a resultfn in our Server_Repl class...
 resultfn = None                 # None retains default behaviour
@@ -354,6 +516,10 @@ class Client_Repl(mincemeat.Client):
             store_results(txn, data)
             return True
 
+        if command == "statsdone":
+            print_stats(txn, data)
+            return True
+
         return False
 
 
@@ -398,30 +564,40 @@ class Server_Repl(mincemeat.Server):
         by the Client.  We'll map our txn back to the client's when
         returning the results.
         """
-        logging.info("%s received command via %s from peer %s: %s %s" % (
-                self.name(), chan.name(), str(chan.addr), 
+        # We MUST put in place the "in-flight" mapping of this local
+        # txn to the correspoding Client txn and channel, BEFORE we
+        # set the data source; if the datasource is empty, processing
+        # will be immediate (as set_datasource will jump-start the
+        # TaskManager, producing a call to resultfn directly),
+        # accessing self.inflight[loctxn])!
+        loctxn = str(self.loctxn)
+        self.loctxn += 1
+        self.inflight[loctxn] = {
+            'txn':          txn,
+            'chan':         chan,
+            'command':      command,
+            }
+
+        logging.info("%s txn %s (via %s from peer %s): %s %s" % (
+                self.name(), loctxn, chan.name(), str(chan.addr), 
                 '/'.join( [command] + ( txn and [txn] or [])),
                 repr.repr(data)))
 
         if command == "transaction":
-            path = os.path.join( "../Gutenberg SF CD/Gutenberg SF",
-                                 str(data))
-            data = file_contents( path )
-            loctxn = str(self.loctxn)
-            self.loctxn += 1
+            glob 		= data
+            meta 		= False
+            if glob.startswith('@'):
+                glob		= glob[1:]
+                meta 		= True
+            path = os.path.join( textbase, glob )
+            if meta:
+                data		= file_meta( path,
+                    "lambda corpus: open(corpus).read()" )
+            else:
+                data		= file_contents( path )
 
-            # We MUST put in place the "in-flight" mapping of this
-            # local txn, to the correspoding Client txn and channel,
-            # BEFORE we set the data source; if the datasource is
-            # empty, processing will be immediate (as set_datasource
-            # will jump-start the TaskManager, producing a call to
-            # resultfn directly).
-            logging.warning("%s Map/Reduce txn %s: %s ==> %d files" % (
-                self.name(), loctxn, path, len(data)))
-            self.inflight[loctxn] = {
-                'txn':          txn,
-                'chan':         chan,
-                }
+            logging.warning("%s Map/Reduce %s ==> %d files" % (
+                self.name(), path, len(data)))
             self.set_datasource(
                 datasource      = data,
                 txn             = loctxn,
@@ -429,6 +605,28 @@ class Server_Repl(mincemeat.Server):
                 cycle           = mincemeat.TaskManager.PERMANENT )
             return True
 
+        if command == "stats":
+            logging.warning("%s Stats" % (
+                self.name()))
+
+            # TODO.  Limiting this on the instantaneous size of the
+            # channels is wrong; if a channel dies, we'll never end,
+            # and this won't guarantee one-to-one command to channel
+            # mapping, etc...
+            self.set_datasource(
+                datasource      = repeat_command(
+                    "lambda corpus: enumerate([(socket.getfqdn(), os.name)])",
+                    limit=len(self.taskmanager.channels)),
+                txn             = loctxn,
+                allocation      = mincemeat.TaskManager.ONESHOT,
+                cycle           = mincemeat.TaskManager.PERMANENT )
+            return True
+
+        # Command not recognized!  Kill inflight entry
+        logging.info("%s tnx %s: command %s unrecognized" % (
+                self.name(), loctxn,
+                '/'.join( [command] + ( txn and [txn] or []))))
+        del self.inflight[loctxn]
         return False
 
     def resultfn(self, txn, results):
@@ -443,7 +641,7 @@ class Server_Repl(mincemeat.Server):
             logging.warning("%s Map/Reduce txn %s: results via %s: %s" % (
                     self.name(), txn, client['chan'].name(),
                     repr.repr(results)))
-            client['chan'].send_command( "transactiondone", data=results,
+            client['chan'].send_command( client['command'] + "done", data=results,
                                          txn=client['txn'] )
         else:
             logging.error("%s unable to identify txn %s results in %s: %s" % (
@@ -463,7 +661,8 @@ def REPL( cli ):
     txn = 0
     print "Which files?  eg. '*.txt<enter>'"
     while cli.is_alive():
-        print "GLOB> ",
+        sys.stdout.write( "GLOB> " )
+        sys.stdout.flush()
         try:
             inp = sys.stdin.readline()
         except:
@@ -474,8 +673,9 @@ def REPL( cli ):
                 cli.mincemeat.send_command_backchannel("transaction", inp,
                                                        txn=str(txn))
             else:
-                # blank line
-                continue
+                # blank line.  Get some stats.
+                cli.mincemeat.send_command_backchannel("stats", inp,
+                                                       txn=str(txn))
         else:
             # EOF
             break
