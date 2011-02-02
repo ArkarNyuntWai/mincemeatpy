@@ -47,7 +47,7 @@ SF" directory into it:
 have some handy ASCII text data files:
 """
 
-textbase = "../Gutenberg SF CD/Gutenberg SF"
+textbase = ["..", "Gutenberg SF CD", "Gutenberg SF"]
 
 # 
 # Data Source.
@@ -121,17 +121,27 @@ class repeat_command(object):
     length, so provide no __len__()), but that's OK; len() is never
     used.
     
-    If the default limit=None is used, then this object should be used
+    If the default times=None is used, then this object should be used
     as a datasource only if TaskManager.ONESHOT is specified (send one
     Map task to each Client).
     """
-    def __init__(self, command, data="", limit=None):
+    def __init__(self, command, data="", times=None):
         self.command = command
         self.data = data
-        self.limit = limit
+        self.times = times
     def __iter__(self):
+        """
+        Returns a generator expression yielding #@command strings,
+        optionally for the specified number of times.
+        """
+        # Contrary to "equivalent code" in documentation, providing
+        # None for times doesn't produce infinite itertools.repeat...
+        if self.times is None:
+            args = (self.command,)
+        else:
+            args = (self.command, self.times)
         return ("%d@%s" % (idx, cmd) for idx, cmd in
-                enumerate(itertools.repeat(self.command, self.limit)))
+                enumerate(itertools.repeat(*args)))
     def __getitem__(self, key):
         return self.data
 
@@ -367,7 +377,7 @@ def store_results(txn, results):
 def server_results(txn, results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
-    print "Transaction %s; %s%d results:" % (
+    print "Transaction %s; Word Count; %s%d results:" % (
         txn, ( top and "top %d of " % top or ""), len(results))
     # Collect lists of all words with each unique count
     bycount = {}
@@ -391,12 +401,14 @@ def server_results(txn, results, top=None):
                             reversed(bycountlist)):
         print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
 
-def print_stats(txn, results):
+def stats_results(txn, results):
     # Collection of Stats from all Clients complete.
-    print "Stats %s; %d results:" % (
+    print "Transaction %s; Stats; %d results:" % (
         txn, len(results))
-    for k, v in results.iteritems():
-        print "%-16s: %s" % (k, v)
+    for k, vs in results.iteritems():
+        for v in vs:
+            print "%-16s: %s" % (k, v)
+    sys.stdout.flush()
 
 # We'll provide a resultfn in our Server_Repl class...
 resultfn = None                 # None retains default behaviour
@@ -444,7 +456,8 @@ class Cli(mincemeat.Client_daemon):
         within a certain period, there will be... trouble.
         """
         if not done:
-            self.mincemeat.ping( allowed=30.0)
+            self.mincemeat.ping(allowed=30.0)
+
 
 class Client_Repl(mincemeat.Client):
     """
@@ -458,23 +471,26 @@ class Client_Repl(mincemeat.Client):
         self.pongtim = None             # time when pong received
         self.pongtxn = None             # it's transaction
 
-    def ping(self, payload=None, now=None, allowed=None):
+    def ping(self, allowed=None):
         """
-        Send a ping command with a tell-tale time as the transaction
-        ID.  Allow a certain amount of delay before killing our
-        connection to the (crippled) server.
+        Send a ping command to our Server, with a tell-tale time as
+        the transaction ID (this is the default ping behavior).  Allow
+        a certain amount of delay before killing our connection to the
+        (crippled) server.
 
         This method must be invoked (at least) often enough to ensure
         that, under normal circumstances, the inter-ping latency, plus
         any normal Server response delay, plus the round-trip trip
         time does not exceed the allowed time.
         """
-
         # Check the last pong received.  Defaults to whenever we
         # began.  If we exceed allowed, treat as a protocol failure
         # (same as EOF).  Otherwise, send another ping.
         now = time.time()
         if self.pongtxn is not None:
+            # We note that a pong has been received.  Compute the
+            # actual ping latency, and also how long since it was
+            # seen.
             delay, delaymsg = self.ping_delay(txn=self.pongtxn,
                                               now=self.pongtim)
             since, sincemsg = self.ping_delay(txn=self.pongtxn,
@@ -485,12 +501,12 @@ class Client_Repl(mincemeat.Client):
             since = now - self.pingbeg
             sincemsg = "%.3f s (no replies received)" % since
 
-        if since > allowed:
+        if allowed is not None and since > allowed:
             logging.warning("%s ping latency %s, last %s; Exceeds %.3fs allowed; disconnecting!" % (
                 self.name(), delaymsg, sincemsg, allowed))
             self.handle_close()
         else:
-            logging.info("%s ping latency %s, last %s < %s" % (
+            logging.info("%s ping latency %s, last %s <= %s" % (
                 self.name(), delaymsg, sincemsg, allowed))
             mincemeat.Client.ping(self, now=now)
 
@@ -512,12 +528,11 @@ class Client_Repl(mincemeat.Client):
                 '/'.join( [command] + ( txn and [txn] or [])),
                 repr.repr(data)))
 
-        if command == "transactiondone":
+        if command in (
+            "transactiondone", 
+            "statsdone",
+            ):
             store_results(txn, data)
-            return True
-
-        if command == "statsdone":
-            print_stats(txn, data)
             return True
 
         return False
@@ -531,10 +546,12 @@ class Svr(mincemeat.Server_daemon):
         us; it also runs all the Server's ServerChannel's; hence, we
         use send_command, send_command_backchannel not necessary.
 
-        We don't have anything to do, but we set this up as an example.
+        We have a number of channels open to Clients.  We want to
+        ensure that each Client remains responsive.  This means
+        sending a ping to each, ensuring a timely response.
         """
-        logging.debug("%s Svr timeout %s" % (
-                self.name(), done and "done" or ""))
+        if not done:
+            self.mincemeat.ping(allowed=30.0)
 
 
 class Server_Repl(mincemeat.Server):
@@ -552,6 +569,7 @@ class Server_Repl(mincemeat.Server):
         mincemeat.Server.__init__(self, *args, **kwargs)
         self.loctxn = 1000
         self.inflight = {}
+        self.pongseen = {}	# When last pong seen from Client
 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
@@ -589,7 +607,7 @@ class Server_Repl(mincemeat.Server):
             if glob.startswith('@'):
                 glob		= glob[1:]
                 meta 		= True
-            path = os.path.join( textbase, glob )
+            path = os.path.join(*(textbase + [glob]))
             if meta:
                 data		= file_meta( path,
                     "lambda corpus: open(corpus).read()" )
@@ -608,15 +626,10 @@ class Server_Repl(mincemeat.Server):
         if command == "stats":
             logging.warning("%s Stats" % (
                 self.name()))
-
-            # TODO.  Limiting this on the instantaneous size of the
-            # channels is wrong; if a channel dies, we'll never end,
-            # and this won't guarantee one-to-one command to channel
-            # mapping, etc...
+            # This datasource is an unlimited iterator; only usable in ONESHOT
             self.set_datasource(
                 datasource      = repeat_command(
-                    "lambda corpus: enumerate([(socket.getfqdn(), os.name)])",
-                    limit=len(self.taskmanager.channels)),
+                    "lambda corpus: enumerate([(socket.getfqdn(), os.name)])"),
                 txn             = loctxn,
                 allocation      = mincemeat.TaskManager.ONESHOT,
                 cycle           = mincemeat.TaskManager.PERMANENT )
@@ -648,6 +661,41 @@ class Server_Repl(mincemeat.Server):
                     self.name(), txn, repr.repr(self.inflight),
                     repr.repr(results)))
 
+    def ping(self, allowed=None):
+        """
+        Override mincemeat.Server.ping to check that we've received a
+        pong from all Clients, and kill any ServerChannels to
+        (apparenly) dead Clients.  Retain the default behavior, which
+        is to send a ping to all Clients via their ServerChannel.
+
+        We'll traverse all the Server's known channels; the first time
+        we encounter a channel, we'll default to believing we've just
+        seen a pong from it's Client (given it the full allowed
+        timeout to comply).
+
+        As soon as the last pong seen time exceeds allowed seconds
+        ago, we'll kill the channel.
+        """
+        now = time.time()
+        for chan in self.taskmanager.channels.keys():
+            last = self.pongseen.setdefault(chan, time.time())
+            if allowed is not None and last + allowed < now:
+                logging.warning("%s pong timeout  from %s; disconnecting" % (
+                        self.name(), chan.name()))
+                chan.handle_close()
+            else:
+                logging.info(   "%s pong response from %s, %s s ago" % (
+                        self.name(), chan.name(), now - last))
+
+        mincemeat.Server.ping(self)
+
+    def pong(self, chan, command, data, txn):
+        """
+        Override mincemeat.Server.pong to just remember when we last
+        saw a pong from this channel.
+        """
+        self.pongseen[chan] = time.time()
+        mincemeat.Server.pong(self, chan, command, data, txn)
 
 def REPL( cli ):
     """
@@ -667,27 +715,33 @@ def REPL( cli ):
             inp = sys.stdin.readline()
         except:
             inp = None
+
         if inp:
             inp = inp.rstrip()
             if inp:
-                cli.mincemeat.send_command_backchannel("transaction", inp,
-                                                       txn=str(txn))
+                # A filename pattern?  Count some words.
+                cmd = "transaction"
             else:
-                # blank line.  Get some stats.
-                cli.mincemeat.send_command_backchannel("stats", inp,
-                                                       txn=str(txn))
+                # A Blank line.  Get some stats.
+                cmd = "stats"
+            cli.mincemeat.send_command_backchannel(
+                cmd, inp, txn=str(txn))
         else:
             # EOF
             break
-        txn += 1
 
         # Wait for results to appear, or client to die.
         while cli.is_alive() and not global_results:
-            time.sleep(.25)
+            time.sleep(.1)
 
         if global_results:
             args = global_results.popleft()
-            server_results(top=100, *args)
+            if cmd == "transaction":
+                server_results(top=100, *args)
+            elif cmd == "stats":
+                stats_results(*args)
+
+        txn += 1
     
 
 def main():
@@ -809,5 +863,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.INFO )
+    logging.basicConfig( level=logging.WARNING )
     sys.exit(main())
