@@ -1455,7 +1455,13 @@ class Server(asyncore.dispatcher, object):
         """
         Run this Server (and anything else sharing its _map), cleaning
         it up on failure.  (See mincemeat.process or
-        mincemeat.Client.process for more details)
+        mincemeat.Client.process for more details).
+
+        By the time this is invoked, any optional parameters passed to
+        *_daemon.__init__, and thence to *_daemon.process, must have
+        been soaked up by matching positional paramters in derived
+        class' methods, before we get here.  Only timeout=... is
+        allowed.
         """
         return process(timeout=timeout, map=self._map, schedule=self.schedule)
 
@@ -2193,11 +2199,11 @@ class Mincemeat_daemon(threading.Thread):
     enters "success" state; if an exception terminates processing,
     enters a "failed: ..." state.
     """
-    def __init__(self, credentials=None, cls=None,
+    def __init__(self, credentials, cls=None,
                  map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
+                 **kwargs):
         threading.Thread.__init__(self, target=self.process,
-                                  args=args, kwargs=kwargs)
+                                  kwargs=kwargs)
         self.daemon = True
         self._state = "idle"
 
@@ -2232,9 +2238,12 @@ class Mincemeat_daemon(threading.Thread):
         Any extraneous arguments passed to the constructor are assumed
         to be arguments to .process(...)
 
-        Default processing loop.  With no args, will simply process
-        with no timeout, 'til underlying mincemeat object is finished
-        (its asyncore.dispatcher._map is empty).
+        Override this method in derived mincemeat.*_daemon classes, to
+        trap custom args/kwargs passed to __init__.
+
+        Implements the default processing loop.  With no args, will
+        simply process with no timeout, 'til underlying mincemeat
+        object is finished (its asyncore.dispatcher._map is empty).
 
         If timeout() is overriden in derived class, pass a
         'timeout=#.#' keyword arg to class consructor (eg. {
@@ -2297,19 +2306,20 @@ class Client_daemon(Mincemeat_daemon):
     Defaults to use its own asyncore socket map; set map=<dict> to use
     a common map (and one thread) to active multiple objects derived
     from asyncore.dispatcher or asynchat.async_chat.
+
+    Any additional keyword arguments (no positional args allowed!) are
+    passed (ultimately, via kwargs), to Mincemeat_daemon.process;
+    override .process to trap additional configuration data you wish
+    to pass via __init__ to a derived mincemeat.*_daemon.
     """
-    def __init__(self, credentials, cls=Client,
-                 map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
+    def __init__(self, credentials, cls=Client, **kwargs):
         Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
 class Server_daemon(Mincemeat_daemon):
     """
     Start a mincemeat.Server (by default), as a daemon.
     """
-    def __init__(self, credentials, cls=Server,
-                 map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
+    def __init__(self, credentials, cls=Server, **kwargs):
         Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
 def run_client():

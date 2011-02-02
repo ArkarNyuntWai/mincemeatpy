@@ -446,6 +446,13 @@ def logchange( who, previous ):
 
 class Cli(mincemeat.Client_daemon):
 
+    def process(self, allowed=None, *args, **kwargs):
+        """
+        Trap an "allowed=#" kwarg passed to mincemeat.*_daemon.__init__().
+        """
+        self.allowed = allowed
+        mincemeat.Client_daemon.process(self, *args, **kwargs)
+
     def timeout(self, done=False):
         """
         The Client_daemon's process (asyncore.loop) thread is invoking
@@ -456,7 +463,7 @@ class Cli(mincemeat.Client_daemon):
         within a certain period, there will be... trouble.
         """
         if not done:
-            self.mincemeat.ping(allowed=30.0)
+            self.mincemeat.ping(self.allowed)
 
 
 class Client_Repl(mincemeat.Client):
@@ -464,6 +471,12 @@ class Client_Repl(mincemeat.Client):
     A mincemeat.Client that knows how to process the "transactiondone"
     response, containing the results of a previous "transaction"
     command, sent by the REPL vai the Client, to the Server.
+
+    Override process here, to trap kwargs via *_daemon.__init__,
+    *_daemon.process, and finally to Client.process.  This allows all
+    keyword options classes derived from either mincemeat.*_daemon OR
+    mincemeat.Client/.Server, to be passed to the derived
+    *_daemon.__init__()!
     """
     def __init__(self, *args, **kwargs):
         mincemeat.Client.__init__(self, *args, **kwargs)
@@ -540,6 +553,13 @@ class Client_Repl(mincemeat.Client):
 
 class Svr(mincemeat.Server_daemon):
 
+    def process(self, allowed=None, *args, **kwargs):
+        """
+        Trap an "allowed=#" kwarg passed to mincemeat.*_daemon.__init__().
+        """
+        self.allowed = allowed
+        mincemeat.Server_daemon.process(self, *args, **kwargs)
+        
     def timeout(self, done=False):
         """
         The Server_daemon's process (asyncore.loop) thread is invoking
@@ -551,7 +571,7 @@ class Svr(mincemeat.Server_daemon):
         sending a ping to each, ensuring a timely response.
         """
         if not done:
-            self.mincemeat.ping(allowed=30.0)
+            self.mincemeat.ping(self.allowed)
 
 
 class Server_Repl(mincemeat.Server):
@@ -765,7 +785,8 @@ def main():
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = Cli(credentials, cls=Client_Repl, timeout=5.0)
+                    cli = Cli(credentials, cls=Client_Repl,
+                              timeout=15.0, allowed=65.0)
                     clista = logchange( cli, clista )
                     cli.start()
                     clista = logchange( cli, clista )
@@ -792,7 +813,8 @@ def main():
                 # Client didn't come up and/or didn't immediately
                 # authenticate.  Create a Server_Repl.
                 try:
-                    svr = Svr(credentials, cls=Server_Repl, timeout=5.0)
+                    svr = Svr(credentials, cls=Server_Repl,
+                              timeout=15.0, allowed=65.0)
                     svrsta = logchange( svr, svrsta )
                     svr.start()
                     svrsta = logchange( svr, svrsta )
