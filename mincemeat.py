@@ -95,11 +95,25 @@ def applyover(func, itr):
     except TypeError:
         return generator(func)(itr)
 
+
+# ##########################################################################
+# 
+# process               -- asyncore event loop, with synchronous scheduling
+# 
+#     Implements the traditional asyncore.loop processing loop
+# supporting arbitrary numbers of asyncore.dispatcher and/or
+# asynchat.async_chat based objects sharing a single socket map.
+# 
+#     Also implements auto-firing scheduled events (one-shot or
+# repeating), while respecting the (optional) caller-defined timeout.
+# 
 def process(timeout=None, map=None, schedule=None):
     """
-    Processes asyncore based Server or Client events 'til none left,
-    dispatching scheduled events as we go.  On Exception, forcibly
-    cleans up all sockets using the same asyncore map.
+    Processes asyncore based Server or Client events 'til none left
+    (or timeout expires), dispatching scheduled events as we go.  On
+    Exception, forcibly cleans up all sockets using the same asyncore
+    map.  Return True while more events may be possible, and the
+    caller should re-invoke.
 
     If multiple sets of asyncore based objects use separate maps, then
     each separate map needs to be run using a process (or
@@ -132,67 +146,85 @@ def process(timeout=None, map=None, schedule=None):
     each event) another scheduled event was added, it will influence
     the timeout of the next invocation.  It is recommended that a
     thread-safe container like collections.deque is used, if multiple
-    threads may schedule events.  All events are of the form
-    (expiry,callable), where expiry is a timer() value, and callable
-    is any callable (normally, a bound method of an
-    asyncore.dispatcher based object)
+    threads may schedule events.
+    
+    All schedule events are of the form (expiry,callable,repeat),
+    where expiry is a timer() value, and callable is any callable
+    (normally, a bound method of an asyncore.dispatcher based object),
+    and repeat is a number of seconds (or None)
     """
     try:
         if map is None:
             map = asyncore.socket_map           # Internal asyncore knowledge!
 
         beg = now = timer()
-        dur = 0.0
-        while map and (timeout is None or dur <= timeout):
+        dur = -1.
+        while map and (timeout is None or dur < timeout):
             # Events on 'map' still possible, and either 'timeout' is
-            # infinite, or we haven't yet exceeded it.  NOTE: We
+            # infinite, or we haven't yet reached it.  NOTE: We
             # *always* want to do at least one cycle, even if timeout
-            # == 0, hence the <= instead of <.
+            # == 0, hence the initial dur = -1
+            remains = [] # Append any potential new expiries created during loop
             exp = None
             if schedule:
                 # Dispatch expired scheduled events.  Any scheduled
                 # events remaining after 'map' is empty (all sockets
                 # closed) will never be fired!
-                for exp,fun in sorted(schedule):
+                for exp,fun,rpt in sorted(schedule):
                     try:
                         if now >= exp:
-                            logging.info("%s expired; Firing %r" % (exp, fun))
+                            logging.debug("Firing scheduled event %s (repeat: %s)" % (
+                                    '.'.join( [] if not hasattr(fun, "im_class") 
+                                              else [fun.im_class.__name__]
+                                              + [fun.__name__]), rpt))
                             fun()               # Timer expired; fire fun()!
                         else:
                             break               # Timer in future; done.
                     except Exception, e:
                         # A scheduled event failed; this isn't
                         # considered fatal, but may be of interest...
-                        logging.warning("Failed scheduled event %s: %s" % (
-                                fun, e))
+                        logging.warning("Failed scheduled event %s: %s\n%s" % (
+                                fun, e, traceback.format_exc()))
                 
                     # This event was at or before now (and was fired);
                     # remove it and get next one (if any).  We'll
                     # always refresh 'now' after every fun() firing,
                     # b/c arbitrary time has elapsed.
-                    schedule.remove((exp,fun))
+                    schedule.remove((exp,fun,rpt))
                     now = timer()
+                    if rpt:
+                        # Careful re-schedule the event.  If we've
+                        # already missed one (or more) timeouts, log
+                        # and re-schedule for the next multiple of
+                        # repeat still in the future.
+                        mis = int((now - exp) / rpt)
+                        if mis:
+                            logging.warning("Missed %d firings of schedule event %s" % (
+                                    mis, fun))
+                        exp += (mis + 1) * rpt
+                        remains.append(exp - now)
+                        schedule.append((exp, fun, rpt))
                     exp = None
             
             # Done firing any expired events.  The expiry 'exp' of the
             # one that fired the break (if any) will limit expiry
             # timeout; 'now' is recently refreshed.  Deduce time that
-            # 'remains'; None means no timeout.
+            # remains; None means no timeout.
             dur = now - beg
-            rem = []
             if exp is not None:                 # A (finite) event awaits...
-                rem.append(exp - now)
+                remains.append(exp - now)
             if timeout is not None:             # A (finite) timeout defined...
-                rem.append(timeout - dur)
+                remains.append(timeout - dur)
             # Convert durations list to scalar minimum, None for inf.
-            if rem:
-                rem = min(rem)
+            if remains:
+                remains = min(remains)
             else:
-                rem = None
-            #logging.debug("asyncore.loop map %s, dur: %f, rem: %f, timeout: %s" % (
-            #        repr.repr(map), dur, rem, timeout))
+                remains = None
+            logging.debug("asyncore.loop %d sock., dur: %3.6f, remains: %3.7f of timeout: %s" % (
+                    len(map), dur,
+                    remains if remains is not None else float("inf"), timeout))
 
-            asyncore.loop(timeout=rem, map=map, count=1)
+            asyncore.loop(timeout=remains, map=map, count=1)
             now = timer()
             dur = now - beg
 
@@ -236,7 +268,286 @@ def close_all(map=None, ignore_all=False):
             logging.warning("Pre-2.6 asyncore; socket map cleanup incomplete: %s" % (e))
     
 
+# ##########################################################################
+# 
+# Mincemeat_class       -- Interface required by _daemon
+# Mincemeat_daemon      -- Standard daemon Thread fo Client or Server
+# 
+class Mincemeat_class(object):
+    """
+    The default API for a target class of a Mincemeat_daemon.  No
+__init__ (takes no args).
 
+    The normal phases the *_daemon will take us thru is:
+
+     |
+ _daemon.__init__  -- User code creates the _daemon 
+     | __init__      -- creates our instance specified by cls=...
+     | conn          -- invokes to set up networking
+     |
+ _daemon.start()   -- invokes Thread.run(), which ultimately invokes
+   _daemon.process   -- the main _daemon process loop (with optional keywords)
+     | starting        -- provides us with all the optional keywords 
+   +>|(while more I/O events may occur)
+   | | process         -- invoked by _daemon.process w/ minimum computed timeout
+   | | timeout         -- invoked after each timeout (when more events pending)
+   | |   health          -- we call this in base timeout, below
+   +-+ 
+     | stopping    -- invoked once after no more events pending
+     v
+
+
+    """
+    def starting(self, *args, **kwargs):
+        """
+        Invoked at the daemon Thread start-up, with all the (optional)
+        keyword args.
+
+        Responds to the following keywords:
+        
+            interval    -- schedules self.ping on the specified repeat interval
+        
+        """
+        logging.info("%s starting: %s, %s" % ( 
+                self.name(), repr.repr(args), repr.repr(kwargs)))
+
+        interval = kwargs.get("interval", None)
+        if interval:
+            logging.info("%s scheduling ping every %s seconds" % (
+                    self.name(), interval))
+            self.schedule.append((timer() + interval,
+                                  self.ping,
+                                  interval))
+
+    def process(self, timeout=None):
+        """
+        Run this Server (and anything else sharing its _map), cleaning
+        it up on failure.  (See mincemeat.process or
+        mincemeat.Client.process for more details).  Returns when no
+        more events are available to process, or the timeout= expires
+        (never times out, if None.)
+
+        By the time this is invoked, any optional parameters passed to
+        *_daemon.__init__(), and thence to *_daemon.process(), and
+        finally here, must have been soaked up by matching positional
+        arguments in derived class' process methods, before we get
+        here.  Only timeout=... is allowed.
+        """
+        return process(timeout=timeout, map=self._map, schedule=self.schedule)
+
+    def timeout(self):
+        """
+        May be invoked by on every timeout, if desired (the supplied
+        *_daemon implementations do so).  If overridden, make sure
+        to call this (or health checking won't remain hooked up).
+
+        Return a desired numeric timeout, in seconds; it will be used
+        to shorten the intended timeout.  None implies no shorter
+        timeout desired.  The pattern that overriding methods should
+        follow for computing shortened timeouts is:
+        """
+        shorten = None
+
+        # ... do stuff that might set shorten to a numeric desired timeout
+
+        requested = self.health()
+        if shorten is None or (requested is not None and requested < shorten):
+            # if short is None, requested is always better
+            # otherwise, if requested is numeric, and shorter, use it
+            shorten = requested
+
+        # ... other stuff; repeat above stanza for each new desired timeout
+
+        return shorten
+
+    def health(self):
+        """
+        May be used to implement health checks (some of supplied
+        *_daemon implementations do so).
+
+        Should check health, and return a desired timeout 'til the
+        next desired health check (default None implies no target
+        timeout desired).
+        """
+        pass
+
+    def stopping(self):
+        """
+        Invoked at the end of processing, after no more events are
+        detected by the Mincemeat_daemon.
+        """
+        pass
+
+
+class Mincemeat_daemon(threading.Thread):
+    """
+    A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
+    numeric timeout= keyword arg creation will cause timeout() to be
+    fired at least every about that many seconds.  By default,
+    allocates a private asyncore socket map, so we can process async
+    I/O events using a separate thread from any other asyncore derived
+    object.
+
+    Note that an overridden Thread.run method does *not* receive the
+    args= or kwargs= passed to threading.Thread.__init__; Only a
+    target=... method invoked by the default run() does!  This is not
+    overly clear in the Python threading.Thread documentation.
+
+    Raises exception on the Server's failure to bind, or a Client's
+    failure to connect.
+
+    After start(), processes 'til the processing loop completes, and
+    enters "success" state; if an exception terminates processing,
+    enters a "failed: ..." state.
+    """
+    def __init__(self, credentials, cls=None,
+                 map=None, schedule=None, shuttout=.5,
+                 **kwargs):
+        threading.Thread.__init__(self, target=self.process,
+                                  kwargs=kwargs)
+        self.daemon = True
+        self._state = "idle"
+
+        # Instantiate the (NOT optional!) Client or Server class, and
+        # invoke its conn with the (also NOT optional) credentials.
+        # We make cls=None to ensure that they are not positional
+        # parameters, and force this to crash if not specified.
+        if map is None:
+            map = {}
+        if schedule is None:
+            schedule = collections.deque()
+        self.mincemeat = cls(map=map, schedule=schedule, shuttout=shuttout)
+        if not hasattr(self.mincemeat, '_map'):
+            raise AttributeError("%s requires a cls=... object be derived from asyncore.dispatcher"
+                                  % (self.__class__))
+        logging.debug("%s using asyncore socket map: %s" % (
+            self.mincemeat.name(), repr.repr(self.mincemeat._map)))
+        self.mincemeat.conn(asynchronous=True, **credentials)
+
+    def name(self):
+        return self.mincemeat.name()
+
+    def state(self):
+        if self._state == "processing":
+            if self.mincemeat.authenticated():
+                self._state = "authenticated"
+        return self._state
+
+    def process(self, **kwargs):
+        """
+        This is the threading.Thread's target= method; the daemon's
+        main method.  It is invoked once; when this method returns,
+        the daemon Thread is done, and may be join()-ed.  All of the
+        keyword arguments are passed to the target mincemeat Server or
+        Client.starting(...) method.
+
+        Responds to the following keywords:
+        
+            timeout     -- the longest interval between invocations of timeout()
+
+        Invokes the process() method in the mincemeat Client or
+        Server.  Any extraneous arguments passed to the constructor
+        are assumed to be arguments passed to Client or
+        Server.process(...).  By default, the only one it understands
+        is timeout=.  If specified, Fires the *_daemon.timeout() and
+        mincmeat.Server/Client .timeout() methods.  Interprets their
+        return values as desired 
+
+        Implements the default processing loop.  If no timeout= was
+        specified to __init__, it will simply process with no timeout,
+        'til underlying mincemeat object is finished (its
+        asyncore.dispatcher._map is empty).  The timeout() methods will
+        never be fired, until the very end (with done=True).
+
+        If timeout() is overriden in derived class, pass a timeout=#
+        keyword arg to class constructor to implement a timed
+        event-loop.  Then, timeout() will fire at least every timeout=
+        seconds; if timeout returns a smaller numeric value, this will
+        be used to reduce the next timeout interval.
+        """
+        logging.info("%s processing (%s)" % (
+                self.name(), repr.repr(kwargs)))
+        self._state = "processing"
+
+        try:
+            self.mincemeat.starting(**kwargs)
+
+            # Pull 'timeout' out of the keyword args (None if
+            # unspecified) If non-None, we'll kick things off with an
+            # immediate timeout, before proceeding with the default.
+            # This allows us to specify very large timeout, if we know
+            # that we'll primarily be depending on our timeout service
+            # routines to "shorten" it.
+            timeout = kwargs.get('timeout', None)
+            shorten = timeout if timeout is None else 0.0
+            while self.mincemeat.process(timeout=shorten):
+                shorten = timeout
+                requested = self.timeout()
+                if shorten is None or (requested is not None and requested < shorten):
+                    shorten = requested
+                
+            self.mincemeat.stopping()
+        except Exception, e:
+            logging.info("%s failed: %s" % (self.name(), e))
+            self._state = "failed: %s" % e
+        else:
+            # Normal thread exit; if finished() and authenticated(),
+            # assume success
+            if self.mincemeat.finished() and self.mincemeat.authenticated():
+                self._state = "success"
+            else:
+                self._state = "failed: incomplete"
+        logging.info("%s stopping: %s" % (
+                self.name(), self.state()))
+
+    def timeout(self):
+        """
+        Override in derived class (and remember to pass a numeric
+        timeout= keyword argument to __init__ on daemon creation), if
+        a timed event-loop is desired.  It is invoked at every timeout
+        until the event loop detects completion.
+
+        Remember to invoke this base-class method, if you wish to
+        chain timeout() invocations into the mincemeat.Client/Server
+        (ie. to allow it to implement health checks, etc)!
+
+        May optionally return a numeric value; it will be used to
+        specify a shorter desired timeout, in seconds. Returning None
+        means that the standard timeout (the timeout= keyword passed
+        to __init__) will be applied.
+        """
+        shorten = None
+
+        requested = self.mincemeat.timeout()
+        if shorten is None or (requested is not None and requested < shorten):
+            shorten = requested
+
+        return shorten
+
+    def stop(self, timeout=5.):
+        """
+        Stop (and join) the thread (even if incomplete).
+
+        To stop an asyncore.dispatcher based server or client, we'll
+        have to make it close its connections, which will cause its
+        asyncore.loop to cease processing, and its thread to stop.
+        
+        If the server doesn't tidily shut down within the timeout,
+        we'll take more forceful measures.  This could occur if a
+        client is frozen and won't respond to an EOF.
+        """
+        # It is safe (no-op) to invoke this multiple times
+        self.mincemeat.handle_close()
+        self.join(timeout)
+        # Still not dead?  Some client must be frozen.  Try harder.
+        if self.is_alive():
+            close_all(map=self.mincemeat._map, ignore_all=True)
+            self.join(0.)
+
+# ##########################################################################
+# 
+# threaded_async_chat   -- threadsafe asynchat interface, pre-2.6 compatible
+# 
 class threaded_async_chat(asynchat.async_chat):
     """
     Support multithreaded access to pushing data for transmission on
@@ -379,11 +690,11 @@ class threaded_async_chat(asynchat.async_chat):
                                         timeout and timeout - elapsed or timeout)
                 if e:
                     self.handle_expt()
-            except select.error, err:
+            except select.error, e:
                 # Anything that wakes us up harshly will wake up the
                 # main loop's select.  Done (except ignore
                 # well-behaved interrupted system calls).
-                if err.arg[0] != errno.EINTR:
+                if e.arg[0] != errno.EINTR:
                     break
 
     def tidy_close(self):
@@ -620,7 +931,7 @@ class Protocol(threaded_async_chat):
             command += "/" + str(txn)
         if not ":" in command:
             command += ":"
-        if data is not None:	# An empty container is different than None!
+        if data is not None:    # An empty container is different than None!
             pdata = pickle.dumps(data)
             command += str(len(pdata))
             logging.debug("%s -->%s(%s)" % (self.name(), command, repr.repr(data)))
@@ -751,7 +1062,8 @@ class Protocol(threaded_async_chat):
             # We performed a tidy close!  Schedule a real close, in
             # case it doesn't flow through...
             self.schedule.append((timer() + self.shuttout, 
-                                   self.handle_close))
+                                  self.handle_close,
+                                  None))
         else:
             # Already did a shutdown, no connection timeouts, or no
             # schedule to handle them, or an exception while
@@ -772,7 +1084,7 @@ class Protocol(threaded_async_chat):
         self.handle_close()
 
 
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # Un-authenticated commands
     # 
     #     The un-authenticated portion of the protocol, used to
@@ -814,7 +1126,7 @@ class Protocol(threaded_async_chat):
             logging.critical("Unknown unauthed command received: %s" % (command,)) 
             self.handle_close()
         
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # Authenticated commands
     # 
     #      After both ends of the channel have authenticated eachother, they may
@@ -932,7 +1244,7 @@ class Protocol(threaded_async_chat):
                 command, txn))
         self.handle_close()        
 
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # function marshalling utilities
     # 
     #     After authentication, the protocol allows for functions and
@@ -979,13 +1291,16 @@ class Protocol(threaded_async_chat):
             clos = _f(clos_tupl).func_closure
 
         return new.function(code, globs, name, dflt, clos)
-        
 
-class Client(Protocol):
+
+class Client(Protocol, Mincemeat_class):
     """
     Implements a mincemeat Map/Reduce Client.  Connect's to a
     specified server:port, and processes commands (authentication is
     handled by the Protocol superclass).
+
+    Also implements the Mincemeat_class interface, so it may be
+    used as a target of Mincemeat_daeamon.
     """
     def __init__(self, map=None, schedule=None, shuttout=None):
         """
@@ -995,6 +1310,9 @@ class Client(Protocol):
         self.mapfn = self.reducefn = self.collectfn = None
         self.name("Client")
 
+    # ----------------------------------------------------------------------
+    # Methods required by Mincemeat_daemon
+    # 
     def finished(self):
         return self.shutdown is True
 
@@ -1034,25 +1352,10 @@ class Client(Protocol):
         self.connect((interface or "localhost", port))
         if asynchronous is False:
             self.process()
-        
-    def process(self, timeout=None):
-        """
-        Run this Client (and anything else sharing its _map), cleaning
-        it up on failure.  The loop function may raise an exception,
-        but it will forcibly clean up all the map sockets on its way
-        out, so we don't have to worry about that (if it exits
-        cleanly, all map sockets were already cleaned up).
-        
-        The meaning of 'timeout' here differs from asyncore.loop; if
-        None, only returns when complete (map becomes empty).  If a
-        positive numeric value is provided, it returns (soon) after
-        that timeout duration has passed.  
-        
-        Returns Tree iff there may yet be more events to process (and
-        caller should re-invoke.)
-        """
-        return process(timeout=timeout, map=self._map, schedule=self.schedule)
 
+    # ----------------------------------------------------------------------
+    # Protocol command processing
+    # 
     def set_mapfn(self, command, mapfn, txn):
         self.mapfn = self.load_func(mapfn, globals())
 
@@ -1085,8 +1388,6 @@ class Client(Protocol):
         handle either simple functions operating on each individual
         (key,[value,...])  item, or generators which operate over the
         sequence of all items (and hence may employ remembered state).
-
-        Note that if command contains a 
         """
         logging.info("%s Mapping %s" % (self.name(), repr.repr(data[0])))
         results = {}
@@ -1103,8 +1404,10 @@ class Client(Protocol):
             # Use the generator expression, and create a new results
             # dict.  We don't simply update the results in place,
             # because the collectfn may choose to alter the keys
-            # (eg. discarding invalid keys, adding new keys).
-            results = dict((k, [v]) for k, v in rgen)
+            # (eg. discarding invalid keys, adding new keys).  Allow
+            # collectfn to yield (k, [v]) or simple (k, v), but always
+            # return keys mapped to lists.
+            results = dict((k, v if isinstance(v, list) else [v]) for k, v in rgen)
 
         self.send_command('mapdone', (data[0], results), txn)
 
@@ -1160,7 +1463,7 @@ class Client(Protocol):
             self.send_challenge()
 
 
-class Server(asyncore.dispatcher, object):
+class Server(asyncore.dispatcher, Mincemeat_class):
     """
     Server -- Distributes Map/Reduce tasks to authenticated clients.
     
@@ -1269,9 +1572,9 @@ class Server(asyncore.dispatcher, object):
         """
         self.output.append((txn, results))
 
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # Methods required by Mincemeat_daemon
-
+    # 
     def finished(self):
         """
         Detect if finished (either completely, or a Transaction), by
@@ -1322,52 +1625,6 @@ class Server(asyncore.dispatcher, object):
         addr = self.addr and self.addr or (None,None)
         return "Server" + '@' + str(addr[0]) + ':' + str(addr[1])
 
-    def log_info(self, message, type):
-        getattr(logging,type)(message)
-        
-    def run_server(self, password="", port=DEFAULT_PORT, interface="",
-                   asynchronous=False):
-        """
-        Runs the Server, by default synchronously, returning the
-        results when done.
-
-        Use this method in the default asynchronous == False form, if
-        and only if this the only asyncore based object running in
-        this Python instance (or you wish to run all other
-        asyncore-based services with out asyncore.loop thread)!  This
-        is because the default constructor uses the global asyncore
-        socket map, shared with all other asyncore objects.
-
-        Otherwise, use the component methods (ensure that the caller
-        runs asyncore.loop in another thread.)
-
-            s = mincemeat.Server()
-            s.datasource = ...
-            s.mapfn = ...
-            s.collectfn = ...
-            s.reducefn = ...
-            s.finishfn = ...
-            
-            s.conn(**credentials)
-        
-            ac = threading.Thread(target=s.process)
-            ac.start()
-            while not s.finished():
-                ac.join(.1)
-            ac.join()
-
-            results = s.results()
-
-        See the example*.py files for samples of various usages.
-        """
-        self.conn(password=password, port=port, interface=interface,
-                   asynchronous=asynchronous)
-
-        # If we are asynchronous, we have NOT initiated processing;
-        # This will return None, if not finished(), or the results if
-        # we are were not asynchronous.
-        return self.results()
-
     def conn(self, password="", port=DEFAULT_PORT, interface="",
              asynchronous=False, **kwargs):
         """
@@ -1416,14 +1673,15 @@ class Server(asyncore.dispatcher, object):
                                         socket.SO_EXCLUSIVEADDRUSE, 1)
             else:
                 # Posix platform.  See http://goo.gl/LBqSS,
-                # http://goo.gl/lzD8Q We want to set SO_REUSEADDR, to
-                # allow multiple servers to bind() (even if the
-                # address endpoint is still in the TIME_WAIT state)
-                # This will NOT allow multiple parties to
+                # http://goo.gl/lzD8Q.  We want to set SO_REUSEADDR,
+                # to allow multiple servers to bind() (even if the
+                # address endpoint has sockets still in the TIME_WAIT
+                # state.)  This will NOT allow multiple parties to
                 # simultaneously bind() and listen() for incoming
                 # TCP/IP connections, if the address is in the Unicast
-                # range; Multicast addresses will allow it (sometimes
-                # also requiring SO_REUSEPORT)
+                # range (Multicast addresses would allow it (sometimes
+                # also requiring SO_REUSEPORT), but are not typically
+                # used for TCP/IP protocols.)
                 self.set_reuse_addr()
             self.bind(addr)
             self.listen(5)
@@ -1443,6 +1701,10 @@ class Server(asyncore.dispatcher, object):
         # TaskManager to skip that phase.  Since Server.reducefn and
         # .mapfn are not set at Server.__init__ time, we must defer
         # 'til .conn() is invoked, to detect if these are provided.
+        # 
+        # After this point, any Client that connects will be issued
+        # whatever Server.mapfn, .collectfn and .reducefn are
+        # currently defined, so this setting cannot really be changed.
         if self.reducefn is None:
             self.taskmanager.tasks = TaskManager.MAPONLY
         elif self.mapfn is None:
@@ -1451,13 +1713,11 @@ class Server(asyncore.dispatcher, object):
         if asynchronous is False:
             self.process()
 
-    def process(self, timeout=None):
-        """
-        Run this Server (and anything else sharing its _map), cleaning
-        it up on failure.  (See mincemeat.process or
-        mincemeat.Client.process for more details)
-        """
-        return process(timeout=timeout, map=self._map, schedule=self.schedule)
+    # ----------------------------------------------------------------------
+    # overridden asyncore.dispatcher methods
+    # 
+    def log_info(self, message, type):
+        getattr(logging,type)(message)
 
     def handle_accept(self):
         """
@@ -1480,12 +1740,12 @@ class Server(asyncore.dispatcher, object):
             # In Python 2.7+, asyncore.dispatcher.accept is improved,
             # but may still return just None.
             return
-        except socket.error, err:
+        except socket.error, e:
             # ECONNABORTED might be thrown on *BSD (see issue 105). 
             # In Python 2.7+, this is handled (returns None).
-            if err[0] != errno.ECONNABORTED:
+            if e[0] != errno.ECONNABORTED:
                 logging.warning("Unhandled socket error on accept: %s\n%s" % (
-                    err, traceback.format_exc()))
+                    e, traceback.format_exc()))
             return
         else:
             # sometimes addr == None instead of (ip, port) (see issue 104)
@@ -1528,32 +1788,98 @@ class Server(asyncore.dispatcher, object):
         """
         self.handle_close()
 
+    # ----------------------------------------------------------------------
+    # mincemeatpy traditional interface
+    # 
+    #     We remain backward-compatibile with the original
+    # mincemeat.py.  We've split out the connection related
+    # functionality into the conn() method required by
+    # Mincemeat_daemon, but retain the original API.
+    # 
+    def run_server(self, password="", port=DEFAULT_PORT, interface="",
+                   asynchronous=False):
+        """
+        Runs the Server, by default synchronously, returning the
+        results when done.
+
+        Use this method in the default asynchronous == False form, if
+        and only if this the only asyncore based object running in
+        this Python instance (or you wish to run all other
+        asyncore-based services with out asyncore.loop thread)!  This
+        is because the default constructor uses the global asyncore
+        socket map, shared with all other asyncore objects.
+
+        Otherwise, use the component methods (ensure that the caller
+        runs asyncore.loop in another thread.)
+
+            s = mincemeat.Server()
+            s.datasource = ...
+            s.mapfn = ...
+            s.collectfn = ...
+            s.reducefn = ...
+            s.finishfn = ...
+            
+            s.conn(**credentials)
+        
+            ac = threading.Thread(target=s.process)
+            ac.start()
+            while not s.finished():
+                ac.join(.1)
+            ac.join()
+
+            results = s.results()
+
+        See the example*.py files for samples of various usages.
+        """
+        self.conn(password=password, port=port, interface=interface,
+                   asynchronous=asynchronous)
+
+        # If we are asynchronous, we have NOT initiated processing;
+        # This will return None, if not finished(), or the results if
+        # we are were not asynchronous.
+        return self.results()
+
     def set_datasource(self, datasource=None, **kwargs):
         """
-        Set (or enqueue) a Map/Reduce Transaction datasource, starting
-        the TaskManager if it is idle.  Any other keyword args are presumed
-        to be configuration parameters for the TaskManager.
+        Sets the TaskManager datasource, which is expected to be a
+        dict-like object, implementing at least the iterator protocol
+        (.__iter__() returning something with .__iter__() and
+        .next()), and the sequence protocol (at least the
+        .__getitem__() method; .__len__() is not used).
+        
+        Set (or enqueue) a Map/Reduce Transaction, starting
+        the TaskManager if it is idle.  The first positional parameter
+        is presumed to be datasource (eg. when invoked via the
+        self.datasource property); any other keyword args are
+        presumed to be configuration parameters for the TaskManager.
 
-        This method (when called directly) returns the Transaction ID
-        'txn', under which this Map/Reduce Transaction will be
-        processed.  However, if used via the:
+        This method (when called directly) allows specifying other
+        TaskManager parameters, such as cycle=TaskManager.PERMANENT
+        (the default is TaskManager.SINGLEUSE, for historical
+        compatibility -- The TaskManager will shut down the Server
+        after the Map/Reduce Transaction is complete).
 
-            datasource = <something dict-like>
-
-        property, the return txn is inaccessible, making it difficult
-        to identify which Transaction any subsequent Result (via
-        TaskManager.result or resultfn()) matches.
+        We update the kwargs with the datasource, puthe the bundle on
+        deque, and jump-start the TaskManager's idle channels.
         """
-        # Queue it up, and jump-start the TaskManager's idle channels
         kwargs.update({'datasource': datasource})
         self.taskmanager.deque.append(kwargs)
         self.taskmanager.jump_start()
     
     def get_datasource(self):
-        return self.taskmanager and self.taskmanager.datasource or None
+        """
+        Returns the TaskManager's currently active datasource.  This
+        may change asynchronously, as the TaskManager completes
+        Map/Reduce transactions, and pulls new data sources off the
+        deque.
+        """
+        return self.taskmanager.datasource
 
     datasource = property(get_datasource, set_datasource)
 
+    # ----------------------------------------------------------------------
+    # Protocol command processing (hooks invoked by our ServerChannels)
+    # 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
         Process a command, if possible, from the specified
@@ -1564,6 +1890,21 @@ class Server(asyncore.dispatcher, object):
         """
         return False
 
+    def ping(self, message=None, payload=None, now=None):
+        """
+        A Server has multiple ServerChannels to its Clients.  Ping
+        them all.
+        """
+        for chan in self.taskmanager.channels.keys():
+            chan.ping(message=message, payload=chan.name(), now=now)
+
+    def pong(self, chan, command, data, txn):
+        """
+        Invoked on every pong received by any of our ServerChannels.
+        Override to do something interesting with the Client pong
+        responses (eg. heartbeat health monitoring.)
+        """
+        pass
 
 
 class ServerChannel(Protocol):
@@ -1619,8 +1960,9 @@ class ServerChannel(Protocol):
     # commands we issue and the corresponding responses we receive.
     # Any other commands sent/received via the ServerChannel do not
     # affect the taskmanager state.  This allows the taskmanager to
-    # use its channel_... state to determine how the ServerChannel
-    # needs to be prodded, as a Map/Reduce Transaction proceeds.
+    # use its .channels state to determine how the ServerChannel needs
+    # to be prodded, as a Map/Reduce Transaction proceeds, or channels
+    # appear/disappear.
     def start_new_task(self):
         if self.server.shutdown:
             self.tidy_close()
@@ -1628,11 +1970,13 @@ class ServerChannel(Protocol):
         command, data, txn = self.server.taskmanager.next_task(self)
         if command == None:
             self.server.taskmanager.channel_idle(self)
-            logging.info("%s idle" % self.name())
             return
         self.server.taskmanager.channel_sending(self, command, data, txn)
         self.send_command(command, data, txn)
 
+    # ----------------------------------------------------------------------
+    # Protocol command processing (hooks invoked by our ServerChannels)
+    # 
     def map_done(self, command, data, txn):
         self.server.taskmanager.channel_process(self, command, data, txn)
         self.server.taskmanager.map_done(data, txn)
@@ -1654,6 +1998,15 @@ class ServerChannel(Protocol):
             return True
 
         return Protocol.process_command(self, command, data, txn)
+
+    def pong(self, command, data, txn):
+        """
+        Override Protocol.pong to report in with our Server, to
+        support implementation of custom ServerChannel health
+        monitoring.
+        """
+        self.server.pong(self, command, data, txn)
+        Protocol.pong(self, command, data, txn)
 
     def unrecognized_command(self, command, data=None, txn=None):
         """
@@ -1699,16 +2052,18 @@ class TaskManager(object):
     
     After all available 'map' tasks have been assigned to a client,
     any 'map' tasks not yet reported as complete will be
-    (duplicately!) re-assigned to the next client channel that asks.
-    This takes care of stalled or failed clients.
+    (duplicately!) re-assigned to the next client channel that asks,
+    limited by .retransmit percentage.  This takes care of stalled or
+    failed clients.
 
     When all 'map' tasks have been reported as completed (any
     duplicate responses are ignored), then the 'reduce' tasks are
     assigned to the subsequent next_task-calling channels.
 
-    Finally, once all Map/Reduce tasks are completed, the clients are
-    given the 'disconnect' task.
-
+    Finally, once all Map/Reduce tasks are completed, the resultfn is
+    fired, and the clients are given the 'disconnect' task and the
+    Server is shut down, if .cycle is SINGLEUSE; if PERMANENT, the
+    TaskManager goes back to IDLE state, awaiting a new transaction.
     """
     # Possible .state
     IDLE        = 0             # Awaiting a datasource
@@ -1718,10 +2073,28 @@ class TaskManager(object):
     FINISHING   = 4             # Performing Finish phase, preparing results
     FINISHED    = 5             # Final results available; loop or quit
 
+    statename = {
+        IDLE:           "Idle",
+        START:          "Starting",
+        MAPPING:        "Mapping",
+        REDUCING:       "Reducing",
+        FINISHING:      "Finishing",
+        FINISHED:       "Finished",
+        }
+    statecommand = {
+        MAPPING:        "map",
+        REDUCING:       "reduce",
+        }
+    
     # Possible .tasks option
     MAPREDUCE   = 0
     MAPONLY     = 1             # Only perform the Map phase
     REDUCEONLY  = 2             # Only perform the Reduce phase
+    tasksname = {
+        MAPREDUCE:      "Map/Reduce",
+        MAPONLY:        "Skip Reduce",
+        REDUCEONLY:     "Skip Map",
+        }
 
     # Possible .allocation option
     CONTINUOUS  = 0             # Continuously allocate tasks to every channel
@@ -1733,36 +2106,38 @@ class TaskManager(object):
 
     def __init__(self, server,
                  tasks=None, allocation=None, cycle=None):
-        # datasources, etc. on deque ;)  May configure contain
+
+        # The datasources, etc. configurations on deque ;) Contains
         # dicts configuring:
         # 
-        #   .datasource -- A dict-like name/corpus store
+        #   .datasource -- A dict-like name/corpus source
         #   .txn        -- A transaction ID to use (None default)
         #   .cycle      -- ONESHOT or CONTINUOUS (default)
         #   .allocation -- PERMANENT or SINGLEUSE (default)
+        #   .retransmit -- % retransmission factor (when extra channels available)
         # 
+        # Any entries not configured (or containing None) are set to
+        # the value in self.defaults.
+        self.deque = collections.deque()        # {'attr': value, ...}, ...
         self.defaults = {
-            'datasource':       None,
-            'txn':              None,
-            'allocation':       TaskManager.CONTINUOUS,
-            'cycle':            TaskManager.SINGLEUSE
+            "datasource":       None,           # If None, TaskManager will idle
+            "txn":              None,           # Currently running Transaction
+            "allocation":       self.CONTINUOUS,# Allocate tasks 'til datasource empty
+            "cycle":            self.SINGLEUSE, # Shut down Server when complete
+            "retransmit":       5,              # Retransmit re-work to 5% of channels
             }
 
-        self.deque = collections.deque()        # {'attr': value, ...}, ...
-        
         self.server = server
-        self.state = TaskManager.IDLE
-        self.tasks = tasks or TaskManager.MAPREDUCE
-
-        self.datasource = None                  # If None, TaskManager will idle
-        self.txn = None                         # Currently running Transaction
-        self.allocation = allocation or TaskManager.CONTINUOUS
-        self.cycle = cycle or TaskManager.SINGLEUSE
+        self.state = self.IDLE
+        self.tasks = tasks or self.MAPREDUCE
 
         # Track what channels exist, and were last reported as being
         # up to {addr: (command, timetamp), ...}
         self.channels = {}
 
+        # Finally, initialize remaining attrs to the defaults
+        for attr, value in self.defaults.iteritems():
+            setattr(self, attr, value)
 
     # 
     # channel_... -- maintain client .channels activity state
@@ -1777,12 +2152,20 @@ class TaskManager(object):
     #         ...
     #     }
     # 
+    #     Used by .next_task() to track available channel state,
+    # especially for ONESHOT .allocation mode.  When a channel is
+    # closed (a completely asynchronous event), we must give
+    # .next_task() an opportunity to awaken and change state, because
+    # there may be no other non-idle channels with events outstanding
+    # to ever wake it up...  
+    # 
     def channel_opened(self, chan):
         self.channel_idle(chan)
 
     def channel_closed(self, chan):
         self.channel_log(chan, "Disconnect")
         self.channels.pop(chan, None)
+        self.jump_start(count=1)
 
     def channel_idle(self, chan):
         self.channel_log(chan, "Idle")
@@ -1827,27 +2210,44 @@ class TaskManager(object):
                     txn, response and response or "", command,
                     detail and detail or ""))
 
-    def jump_start(self):
+    def jump_start(self, count=None):
         """
         Any ServerChannels that have gone idle must be manually
-        awakened, whenever there may be a new Transaction tasks
-        to process.
+        awakened, whenever there may be a new Transaction tasks to
+        process.  Since this invokes methods that modify self.channels
+        (the dict we're iterating over the items of), iterate over a
+        copy (probably OK in Python 2.x, but dict.items() is destined
+        to return an iterator in the future...)
+
+        Optionally limit the number jump-started to count.
         """
-        for chan, activity in self.channels.iteritems():
+        for chan, activity in list(self.channels.items()):
             if activity is None:
+                logging.debug("%s jump-starting %s" % (
+                        self.server.name(), chan.name()))
                 chan.start_new_task()
+                if count:
+                    count -= 1
+                    if 0 == count:
+                        break
 
     def next_task(self, channel):
         """
         Invoked by ServerChannels after they complete their current
-        Task (or after being awakened), to obtain a new one.
+        Task (or after being awakened), to obtain a new one.  Also, by
+        channel_closed (to wake us up and perhaps transition states,
+        if it was the last channel with pending activity!)
 
         When TaskManager is IDLE, the first one in will check if new
         Transactions are available on deque, and get things going.
         """
-        if self.state == TaskManager.IDLE:
-            # If nothing (or None) is left on the deque, set us back to
-            # defaults.  This will put us back into idle mode.
+        if self.state == self.IDLE:
+            # If nothing (or None) is left on the deque, set us back
+            # to defaults.  This will put us back into idle mode.  It
+            # will also cause any outstanding Map/Reduce tasks for the
+            # present transaction to fall on deaf ears, when they
+            # arrive ('cause we're about to set our self.txn to the
+            # next one on deque, or None)
             try:
                 transaction = self.deque.popleft()
             except:
@@ -1864,77 +2264,174 @@ class TaskManager(object):
             if transaction:
                 logging.warning("%s unrecognized TaskManager configuration: %s " % (
                     self.server.name(), repr.repr(transaction)))
-            if self.datasource is not None:
+            if channel is not None and self.datasource is not None:
                 # Got a datasource; may be empty (we want to return
                 # empty results), but isn't None; Fire it up
-                self.state = TaskManager.START
+                self.state = self.START
             else:
                 # Initial state (no datasource, or not yet appropriate
                 # to start.  Issue any clients an idle task.
                 return (None, None, None)
 
-        if self.state == TaskManager.START:
-            self.map_iter = iter(self.datasource)
-            self.working_maps = {}
-            self.map_results = {}
-            self.state = TaskManager.MAPPING
-            if self.tasks is TaskManager.REDUCEONLY:
-                # If Reduce only, skip the Map phase, passing source
+        if self.state == self.START:
+            # Start of Map/Reduce.  Generate a stream of key, value
+            # pairs, from any object that implements only iterator
+            # protocol, and the __getattr__ method of the sequence
+            # protocol.
+            self.items = ((k, self.datasource[k]) for k in iter(self.datasource))
+            self.been = set()
+            self.done = set()
+            self.work = {}
+            self.results = {}
+            self.state = self.MAPPING
+            if self.tasks is self.REDUCEONLY:
+                # If Reduce only, skip the Map phase, passing datasource
                 # key/value pairs straight to the Reduce phase.
-                self.reduce_iter = self.map_iter
-                self.working_reduces = {}
-                self.results = {}
-                self.stats = TaskManager.REDUCING
-                logging.debug('Server Reducing (skipping Map)')
-            else:
-                logging.debug('Server Mapping')
+                self.state = self.REDUCING
+            logging.debug("%s %s (%s)" % (
+                    self.server.name(), self.statename[self.state],
+                    self.tasksname[self.tasks]))
 
-        if self.state == TaskManager.MAPPING:
+        if self.state in (self.MAPPING, self.REDUCING):
+            # For ONESHOT allocation, we remember in-progress
+            # Map/Reduce tasks by channel, too; as soon as each
+            # channel has .been here, and .done that task, we are done
+            # (any remaining tasks on the map_iter are ignored; it
+            # may indeed be a non-terminating iterator in this mode)!
+            #
+            # We need to be careful to be sensitive to a channel
+            # disappearing; if all other channels are done their
+            # assigned task and are idle, and a channel dies and
+            # is closed, we could hang; we need to jump-start one of
+            # the other channels (if any) and fire its start_new_task
+            # to get the thread back in there to advance our
+            # TaskManager state, or (if the dead channel is the one
+            # one) we must advance to the next state, with NO
+            # (ie. empty) Map results...  This is done via
+            # channel_closed and jump_start.
             try:
-                map_key = self.map_iter.next()
-                map_item = map_key, self.datasource[map_key]
-                self.working_maps[map_item[0]] = map_item[1]
-                return ('map', map_item, self.txn)
-            except StopIteration:
-                # A complete iteration of map items is done; either
-                # pick a random one of those not yet complete to
-                # re-do, or let the client go idle.  
-                if self.allocation is self.CONTINUOUS:
-                    if len(self.working_maps) > 0:
-                        key = random.choice(self.working_maps.keys())
-                        return ('map', (key, self.working_maps[key]), self.txn)
+                if self.allocation == self.ONESHOT:
+                    # ONESHOT.  Assign tasks to all available channels
+                    # 'til each channel has been assigned work.  We
+                    # never assign re-work in this .allocation mode;
+                    # just idle incoming channels 'til they've all
+                    # completed (or died.)
+                    if channel in self.been:
+                        # OK, we've already seen this channel... Done?
+                        if self.been.issuperset(self.channels.keys()):
+                            # Yup; all known channels have .been
+                            # assigned work; enter Map/Reduce
+                            # end-game...  This will also support the
+                            # appearance of a new channel at any
+                            # moment during the phase; it'll get work.
+                            raise StopIteration
+                    # This channel hasn't .been yet; remember we
+                    # gave it some work.
+                    self.been.add(channel)
                 else:
-                    return (None, None, None)
+                    # CONTINUOUS.  Assign tasks to all available
+                    # channels 'til we run out of work (map_iter
+                    # empty).  Then, retransmit work only when we are
+                    # about to fall below our .retransmit factor of
+                    # non-idle channels.
+                    pass
 
-                # No more entries left to Map; begin Reduce (or skip)
-                self.state = TaskManager.REDUCING
-                self.reduce_iter = self.map_results.iteritems()
-                self.working_reduces = {}
-                self.results = {}
-                if self.tasks is TaskManager.MAPONLY:
-                    # Skip Reduce phase, passing the key/value pairs
-                    # output by Map straight to the result.
-                    self.results = self.map_results
-                    self.state = TaskManager.FINISHING
-                    logging.debug('Server Finishing (skipping Reduce)')
-                else:
-                    logging.debug('Server Reducing')
+                # This channel needs a Map/Reduce task item.  Get one
+                # (if available); will raise StopIteration after
+                # map_iter has run out of work.
+                item = self.items.next()
+                self.work[item[0]] = item[1]
+                logging.debug("%s %s %s work" % (
+                        self.server.name(), self.statename[self.state],
+                        channel.name()))
+                return (self.statecommand[self.state], item, self.txn)
 
-        if self.state == TaskManager.REDUCING:
-            try:
-                reduce_item = self.reduce_iter.next()
-                self.working_reduces[reduce_item[0]] = reduce_item[1]
-                return ('reduce', reduce_item, self.txn)
             except StopIteration:
-                if len(self.working_reduces) > 0:
-                    key = random.choice(self.working_reduces.keys())
-                    return ('reduce', (key, self.working_reduces[key]), self.txn)
-                # No more entries left to Reduce; finish (self.results now valid)
-                self.state = TaskManager.FINISHING
+                # A complete CONTINUOUS iteration of Map/Reduce task
+                # items is done (or we've given every channel ONESHOT
+                # of work); If CONTINUOUS, pick a random item of those
+                # .working (not yet complete) to re-do, or let the
+                # client go idle.  Since we can allow clients to go
+                # idle, we must remember to wake them up when we
+                # transition to the Reduce phase!
+                if self.allocation is self.ONESHOT:
+                    # ONESHOT.  Last one here, shut out the lights...
+                    # (we may have dead (closed) channels in .been
+                    # and/or .done).  If there is no longer any live
+                    # channels in the set difference between the .been
+                    # and .done, we are finished.
+                    self.done.add(channel)
+                    busy = self.been.difference(
+                        self.done).intersection(
+                            self.channels.keys())
+                    if busy:
+                        logging.debug("%s %s %s idling (ONESHOT) (%d busy)" % (
+                                self.server.name(), self.statename[self.state],
+                                channel.name(), len(busy)))
+                        return (None, None, None)
+                    logging.debug("%s %s %s complete (ONESHOT)" % (
+                            self.server.name(), self.statename[self.state], 
+                            channel.name()))
+                    # We've .been there, .done that; Done!
+                else:
+                    # CONTINUOUS.
+                    if len(self.work) > 0:
+                        # Channels still working...  Do we want/need
+                        # to schedule some re-work?  Say we have N
+                        # channels, and a % .retransmit; always round
+                        # up (in other words, if any work outstanding,
+                        # and anything other than 0% .retransmit,
+                        # we'll issue at least one channel of rework):
+                        # 
+                        #      N    %               # Chans. Rework:
+                        #     --   --               __
+                        #     21 *  5 + 99 / 100
+                        #              204 / 100 == 2
+                        #     13 *  5 + 99 / 100
+                        #              164 / 100 == 1
+                        #      1 *  5 + 99 / 100
+                        #              104 / 100 == 1
+                        if (len(self.work)
+                             <= ((len(self.channels) * self.retransmit + 99)
+                                / 100)):
+                            key = random.choice(self.work.keys())
+                            logging.debug("%s Mapping %s rework" % (
+                                    self.server.name(), channel.name()))
+                            return ('map', (key, self.work[key]), self.txn)
+                        # Busy, but no more rework required.  Idle it.
+                        logging.debug("%s Mapping %s idling (CONTINUOUS)" % (
+                                self.server.name(), channel.name()))
+                        return (None, None, None)
+                    # All .working Done!
 
-        if self.state == TaskManager.FINISHING:
-            # Map/Reduce Task done.` If .finishfn supplied, support
-            # either .finishfn(iterator), or .finishfn(key,value),
+                if self.state == self.MAPPING:
+                    # MAPPING done; begin Reduce (or straight to FINISHING)
+                    if self.tasks is self.MAPONLY:
+                        # Skip Reduce phase, passing the key/value pairs
+                        # output by the Map straight to the result.
+                        self.state = self.FINISHING
+                        logging.debug("%s Finishing (skipping Reduce)" % (
+                                self.server.name()))
+                    else:
+                        # Mapping done; start Reducing.  Restart all
+                        # idle channels (this is ultimately a
+                        # recursive call; however, we've already
+                        # advanced .state to REDUCING, so we'll be the
+                        # only thread of control that ends up here...
+                        logging.debug("%s Reducing" % (self.server.name()))
+                        self.state = self.REDUCING
+                        self.items = self.results.iteritems()
+                        self.work = {}
+                        self.results = {}
+                        self.jump_start()
+                        # Fall through and Loop to REDUCING state
+                else:
+                    # REDUCING done
+                    self.state = self.FINISHING
+
+        if self.state == self.FINISHING:
+            # Map/Reduce done.  If .finishfn supplied, support
+            # either .finishfn(iterator), or .finishfn(key,values),
             # apply it -- the resultant values are assumed to be
             # finished results, and are NOT encapsulated as a list.
             if self.server.finishfn:
@@ -1943,194 +2440,320 @@ class TaskManager(object):
                 self.results \
                     = dict(applyover(self.server.finishfn,
                                      self.results.iteritems()))
-            self.state = TaskManager.FINISHED
+            self.state = self.FINISHED
 
-        if self.state == TaskManager.FINISHED:
+        if self.state == self.FINISHED:
             # All done; results ready.  Invoke (optionally overridden
             # or redefined) .resultfn with results.  Stop accepting
             # new Client connections, and send ga 'disconnect' to each
             # client that asks for a new task.
             self.server.resultfn(self.txn, self.results)
 
-            if self.cycle == TaskManager.PERMANENT:
-                self.state = TaskManager.IDLE
-                return self.next_task(channel)
+            if self.cycle == self.PERMANENT:
+                self.state = self.IDLE
+                # Fall through and Loop to IDLE state
+            else:
+                # SINGLEUSE.  Done.  Kill server, disconnect any
+                # channels coming for tasks
+                self.server.handle_close()
+                return ('disconnect', None, self.txn)
 
-            # Done.  Kill server, disconnect any channels coming for tasks
-            self.server.handle_close()
-            return ('disconnect', None, self.txn)
+        # When making some state transitions, we'll need to loop, to
+        # determine the work unit to assign to this channel.
+        logging.debug("%s %s %s looping..." % (
+                self.server.name(), self.statename[self.state], channel.name()))
+        return self.next_task(channel)
     
+
     def map_done(self, data, txn):
-        # Don't use the results if they've already been counted, or if
-        # they don't belong to this transaction!  Since clients may
-        # exist beyond the scope of one transaction, and may be
-        # blocked ordelayed nondeterministically, we can't assume that
-        # every Map or Reduce response was associated with this
-        # Transaction.
+        """
+        Absorb Map task responses.
+        
+        Don't use the results if they've already been counted, or if
+        they don't belong to this transaction (eg. the Transaction is
+        done, self.txn is None, and some (duplicate) stragglers have
+        yet to arrive)!
+
+        Since clients may exist beyond the scope of one transaction,
+        and may be blocked or delayed nondeterministically, we can't
+        assume that every Map or Reduce response was associated with
+        this Transaction.
+        """
         if txn != self.txn:
-            logging.info("%s Map result Transaction mismatch: %s != %s" % (
+            logging.debug("%s Map result Task txn mismatch: %s != %s; Ignoring." % (
                     self.server.name(), txn, self.txn ))
             return
-        if not data[0] in self.working_maps:
+        if self.state != self.MAPPING or data[0] not in self.work:
+            logging.debug("%s Map result Task duplicate: %s; Ignoring." % (
+                    self.server.name(), repr.repr(data[0])))
             return
-        logging.debug("Map Done: %s ==> %s" % (data[0], repr.repr(data[1])))
+        logging.debug("Map Done: %s ==> %s" % (
+                repr.repr(data[0]), repr.repr(data[1])))
         for (key, values) in data[1].iteritems():
-            if key not in self.map_results:
-                self.map_results[key] = []
-            self.map_results[key].extend(values)
-        del self.working_maps[data[0]]
+            if key not in self.results:
+                self.results[key] = []
+            self.results[key].extend(values)
+        del self.work[data[0]]
                                 
     def reduce_done(self, data, txn):
-        # Don't use the results if they've already been counted
+        """
+        Absorb Reduce task responses.
+        """
         if txn != self.txn:
-            logging.info("%s Reduce result Transaction mismatch: %s != %s" % (
+            logging.info("%s Reduce result Task txn mismatch: %s != %s; Ignoring" % (
                     self.server.name(), txn, self.txn ))
             return
-        if not data[0] in self.working_reduces:
+        if self.state != self.REDUCING or data[0] not in self.work:
+            logging.debug("%s Reduce result Task duplicate: %s; Ignoring." % (
+                    self.server.name(), repr.repr(data[0])))
             return
-        logging.debug("Reduce Done: %s ==> %s" % (data[0], repr.repr(data[1])))
+        logging.debug("Reduce Done: %s ==> %s" % (
+                repr.repr(data[0]), repr.repr(data[1])))
         self.results[data[0]] = data[1]
-        del self.working_reduces[data[0]]
+        del self.work[data[0]]
 
 
-class Mincemeat_daemon(threading.Thread):
-    """
-    A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
-    numeric 'timeout=' keyword arg creation will cause timeout() to be
-    fired about every that many seconds.  By default, allocates a
-    private asyncore socket map, so we can process async I/O events
-    using a separate thread from any other asyncore derived object.
-
-    Note that an overridden Thread.run method does *not* receive the
-    args= or kwargs= passed to threading.Thread.__init__; Only a
-    target=... method does.  This appears to be a defect (or at least
-    a documentation oversight).
-
-    Raises exception on the Server's failure to bind, or a Client's
-    failure to connect.
-
-    After start(), processes 'til the processing loop completes, and
-    enters "success" state; if an exception terminates processing,
-    enters a "failed: ..." state.
-    """
-    def __init__(self, credentials=None, cls=None,
-                 map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
-        threading.Thread.__init__(self, target=self.process,
-                                  args=args, kwargs=kwargs)
-        self.daemon = True
-        self._state = "idle"
-
-        # Instantiate the (NOT optional!) Client or Server class, and
-        # invoke its conn with the (also NOT optional) credentials.
-        # We make them none to ensure that they are not positional
-        # parameters, and force this to crash if not specified.
-        if map is None:
-            map = {}
-        if schedule is None:
-            schedule = collections.deque()
-        self.mincemeat = cls(map=map, schedule=schedule, shuttout=shuttout)
-        if not hasattr(self.mincemeat, '_map'):
-            raise AttributeError("%s requires a cls=... object be derived from asyncore.dispatcher"
-                                  % (self.__class__))
-        logging.debug("%s using asyncore socket map: %s" % (
-            self.mincemeat.name(), repr.repr(self.mincemeat._map)))
-        self.mincemeat.conn(asynchronous=True, **credentials)
-
-    def name(self):
-        return self.mincemeat.name()
-
-    def state(self):
-        if self._state == "processing":
-            if self.mincemeat.authenticated():
-                self._state = "authenticated"
-        return self._state
-
-    def process(self, *args, **kwargs):
-        """
-        Invoke the event processing on the mincemeat Client or Server.
-        Any extraneous arguments passed to the constructor are assumed
-        to be arguments to .process(...)
-
-        Default processing loop.  With no args, will simply process
-        with no timeout, 'til underlying mincemeat object is finished
-        (its asyncore.dispatcher._map is empty).
-
-        If timeout() is overriden in derived class, pass a
-        'timeout=#.#' keyword arg to class consructor (eg. {
-        'timeout': 30.0 }), to implement a timed event-loop.
-        """
-        logging.info("%s processing(%s, %s)" % (
-                self.name(), repr.repr(args), repr.repr(kwargs)))
-        self._state = "processing"
-        try:
-            while self.mincemeat.process(*args, **kwargs):
-                self.timeout()
-            self.timeout(done=True)
-        except Exception, e:
-            logging.info("%s failed: %s" % (self.name(), e))
-            self._state = "failed: %s" % e
-        else:
-            # Normal thread exit; if finished() and authenticated(),
-            # assume success
-            if self.mincemeat.finished() and self.mincemeat.authenticated():
-                self._state = "success"
-            else:
-                self._state = "failed: incomplete"
-        logging.info("%s stopping: %s" % (
-                self.name(), self.state()))
-
-    def timeout(self, done=False):
-        """
-        Override in derived class (and pass a numeric 'timeout'
-        keyword argument on daemon creation), if a timed event-loop is
-        desired.  It is invoked with done=True when the event loop
-        detects completion.
-        """
-        logging.debug("%s timeout; processing %d sockets: " % (
-                self.name(), len(self._map), repr.repr(self._map)))
-
-    def stop(self, timeout=5.):
-        """
-        Stop (and join) the thread (even if incomplete).
-
-        To stop an asyncore.dispatcher based server or client, we'll
-        have to make it close its connections, which will cause its
-        asyncore.loop to cease processing, and its thread to stop.
-        
-        If the server doesn't tidily shut down within the timeout,
-        we'll take more forceful measures.  This could occur if a
-        client is frozen and won't respond to an EOF.
-        """
-        # It is safe (no-op) to invoke this multiple times
-        self.mincemeat.handle_close()
-        self.join(timeout)
-        # Still not dead?  Some client must be frozen.  Try harder.
-        if self.is_alive():
-            close_all(map=self.mincemeat._map, ignore_all=True)
-            self.join()
-
+# ##########################################################################
+# 
+# Client_daemon         -- Standard Client daemon Thread
+# Server_daemon         -- Standard Server daemon Thread
+# Server_HB             -- Server with all Client health heartbeat monitoring
+# Server_HB_daemon      -- Server_HB daemon Thread
+# Client_HB             -- Client with Server health heartbeat monitoring
+# Client_HB_daemon      -- Client_HB daemon Thread
+# 
+#     Implements various levels of Client and Server functionality,
+# optionally as an independent asynchronous I/O processing daemon
+# Thread.
+# 
 class Client_daemon(Mincemeat_daemon):
     """
-    Start a mincemeat.Client (by default), as a daemon.
+    Start a mincemeat.Client (by default), as a daemon Thread.
 
     Defaults to use its own asyncore socket map; set map=<dict> to use
     a common map (and one thread) to active multiple objects derived
     from asyncore.dispatcher or asynchat.async_chat.
+
+    Any additional keyword arguments (no positional args allowed!) are
+    passed (ultimately, via kwargs), to Mincemeat_daemon.process;
+    override .process to trap additional configuration data you wish
+    to pass via __init__ to a derived mincemeat.*_daemon.
     """
     def __init__(self, credentials, cls=Client,
-                 map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
-        Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
+                 **kwargs):
+        Mincemeat_daemon.__init__(self, credentials, cls=cls,
+                                  **kwargs)
+
 
 class Server_daemon(Mincemeat_daemon):
     """
-    Start a mincemeat.Server (by default), as a daemon.
+    Start a mincemeat.Server (by default), as a daemon Thread.
+
+    We allow any optional keyword arguments to flow through __init__
+    in **kwargs, to be passed (by threading.Thread's target=) to our
+    process method.  We suggest that you handle any supply custom
+    keyword arguments to your derived mincmeat.*_daemon classes this
+    way.
+
+    This allows us to uniformly handle arguments to custom derived
+    components, where we might mix and match, components; eg. using a
+    standard Server_daemon with a custom-derived Server; the standard
+    Server_daemon wouldn't know what keyword parameters to strip off
+    of its __init__() and pass to the custom derived Server cls, and
+    which to forward along for threading.Thread to pass to the target=
+    method...
+
+    In summary: override process in *_daemon, and
+    trap custom keyword parameters there.  Use keywords only;
+    positional parameters are not supported -- only the (required)
+    credentials argument is positional, and must be provided, in first
+    position, in every overridden Mincemeat_daemon.__init__.
     """
     def __init__(self, credentials, cls=Server,
-                 map=None, schedule=None, shuttout=.5,
-                 *args, **kwargs):
-        Mincemeat_daemon.__init__(self, credentials, cls=cls, **kwargs)
+                 **kwargs):
+        Mincemeat_daemon.__init__(self, credentials, cls=cls,
+                                  **kwargs)
+
+
+class Server_HB(Server):
+    """
+    Monitor the Server's Client channel heartbeats.
+    """
+    def __init__(self, *args, **kwargs):
+        Server.__init__(self, *args, **kwargs)
+        self.pongseen = {}
+
+    def starting(self, *args, **kwargs):
+        """
+        Responds to the following keywords:
+        
+            "allowed"   -- must see responses to self.ping within allowed interval
+
+        """
+        self.allowed = kwargs.get('allowed', None)
+        if self.allowed is not None:
+            logging.info("%s allowing %.3f s between pongs" % (
+                    self.name(), self.allowed))
+        Server.starting(self, *args, **kwargs)
+
+    def health(self):
+        """
+        Override mincemeat.Server.health to check that we've received a
+        pong from all Clients, and kill any ServerChannels to
+        (apparenly) dead Clients.  Retain the default behavior, which
+        is to send a ping to all Clients via their ServerChannel.
+
+        We'll traverse all the Server's known channels; the first time
+        we encounter a channel, we'll default to believing we've just
+        seen a pong from it's Client (given it the full allowed
+        timeout to comply).
+
+        As soon as the last pong seen time exceeds allowed seconds
+        ago, we'll kill the channel.  We don't monitor the turnaround
+        time, just the wall-clock time since the last pong was seen.
+        """
+        now = time.time()
+        shorten = None
+        if self.allowed is not None:
+            for chan in self.taskmanager.channels.keys():
+                last = self.pongseen.setdefault(chan, now)
+                since = now - last
+                if since > self.allowed:
+                    logging.warning("%s ping timeout  from %s; unhealthy Client; disconnecting!" % (
+                            self.name(), chan.name()))
+                    chan.handle_close()
+                else:
+                    logging.debug(   "%s ping response from %s, %.3f s ago" % (
+                            self.name(), chan.name(), now - last))
+                    requested = self.allowed - since
+                    if shorten is None or (requested is not None and requested < shorten):
+                        shorten = requested
+                        shortest = chan
+
+        if shorten is not None:
+            logging.debug("%s needs to see a ping response from %s within %.3f s" % (
+                            self.name(), shortest.name(), shorten ))
+
+        # We must return at most self.allowed from now, even if we
+        # don't yet have any channels (hence no shortest)...
+        return shorten if shorten is not None else self.allowed
+
+    def pong(self, chan, command, data, txn):
+        """
+        Override mincemeat.Server.pong to just remember when we last
+        saw a pong from this channel.
+        """
+        self.pongseen[chan] = time.time()
+        Server.pong(self, chan, command, data, txn)
+
+
+class Server_HB_daemon(Server_daemon):
+    """
+    Start a Server with Client channel Heartbeat checks.  After 2
+    heartbeat cycles (7 seconds) are missed, the client channel is
+    closed (15 seconds).
+
+    The cls must be derived from Server_HB, as we assume ping/pong
+    have been instrumented to collect timing information.
+    """
+    def __init__(self, credentials, cls=Server_HB,
+                 interval=7.0, allowed=15.0, timeout=999.0,
+                 **kwargs):
+        Server_daemon.__init__(self, credentials, cls=cls,
+                               interval=interval, allowed=allowed, timeout=timeout,
+                               **kwargs)
+
+class Client_HB(Client):
+    """
+    A mincemeat.Client that knows how heartbeat its Server.
+    """
+    def __init__(self, *args, **kwargs):
+        Client.__init__(self, *args, **kwargs)
+        self.pingbeg = time.time()
+        self.pongtim = None             # time when pong received
+        self.pongtxn = None             # it's transaction
+
+    def starting(self, *args, **kwargs):
+        """
+        Responds to the following keywords:
+        
+            "allowed"   -- must see responses to self.ping within allowed interval
+
+        """
+        self.allowed = kwargs.get('allowed', None)
+        if self.allowed is not None:
+            logging.info("%s allowing %.3f s between pongs" % (
+                        self.name(), self.allowed))
+        Client.starting(self, *args, **kwargs)
+
+    def health(self):
+        """
+        Allow only a certain amount of delay in ping responses before
+        killing our connection to the (crippled) server.
+
+        This method must be invoked (at least) often enough to ensure
+        that, under normal circumstances, the inter-ping latency, plus
+        any normal Server response delay, plus the round-trip trip
+        time does not exceed the allowed time.
+        """
+        # Check the last pong received.  Defaults to whenever we
+        # began.  If we exceed allowed, treat as a protocol failure
+        # (same as EOF).  Otherwise, send another ping.
+        shorten = None
+        now = time.time()
+        if self.pongtxn is not None:
+            # We note that a pong has been received.  Compute the
+            # actual ping latency, and also how long since it was
+            # seen.
+            delay, delaymsg = self.ping_delay(txn=self.pongtxn,
+                                              now=self.pongtim)
+            since, sincemsg = self.ping_delay(txn=self.pongtxn,
+                                              now=now)
+        else:
+            delay = 0.0
+            delaymsg = "?"
+            since = now - self.pingbeg
+            sincemsg = "%.3f s (no replies received)" % since
+
+        if self.allowed is not None and since > self.allowed:
+            logging.warning("%s ping latency %s, last %s; Exceeds %.3f s allowed; Unhealthy Server; disconnecting!" % (
+                self.name(), delaymsg, sincemsg, self.allowed))
+            self.handle_close()
+        else:
+            logging.debug("%s ping latency %s, last %s <= %s" % (
+                self.name(), delaymsg, sincemsg, self.allowed))
+            shorten = self.allowed - since
+
+        if shorten is not None:
+            logging.debug("%s needs to see a pong from Server within %.3f s" % (
+                            self.name(), shorten ))
+
+        # May be None, if we just .handle_close()ed ourself...
+        return shorten
+
+    def pong(self, command, data, txn):
+        """
+        Override the default pong, to remember the transaction numbers
+        of the ping responses we receive, and the time we received them.
+        """
+        self.pongtim = time.time()
+        self.pongtxn = txn
+        Client.pong(self, command, data, txn)
+
+
+class Client_HB_daemon(Client_daemon):
+    """
+    Start a Client with Server Heartbeats.  After 2 heartbeat intervals
+    (27 seconds) go without response, the client channel is closed (60
+    seconds).
+    """
+    def __init__(self, credentials, cls=Client_HB,
+                 interval=27.0, allowed=60.0, timeout=999.0,
+                 **kwargs):
+        Client_daemon.__init__(self, credentials, cls=cls,
+                               interval=interval, allowed=allowed, timeout=timeout,
+                               **kwargs)
+
 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)

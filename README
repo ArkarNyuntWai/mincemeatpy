@@ -8,6 +8,57 @@ REQUIREMENTS
 Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/hashlib/sha1
 
 
+DESCRIPTION
+
+    Applies 2 functions over a datasource:
+
+        {name1: corpus1, ..., nameN: corpusN}
+
+in two phases, roughly corresponding to:
+
+        results = reduce( map( datasource ))
+
+ultimately resulting in results of the form:
+
+	{key1: value, key2: value, ..., keyN: value}
+
+
+    The Map Phase (distributed accross all clients), takes the data
+and produces:
+
+        (name1, corpus1)  ==> (key1, [value, ...]), ..., (keyN, [value, ...])
+	...
+        (nameN, corpusN)  ==> (key1, [value, ...]), ..., (keyN, [value, ...])
+
+    (Server collects all key1 values, ..., keyN values)
+
+    The Reduce Phase (distributed accross all clients), takes the
+combined data from all of the Map phase results, and sends the data
+for one key to each Client:
+
+        (key1, [value, ...]) ==> (key1, result)
+	...
+        (keyN, [value, ...]) ==> (keyN, result)
+
+    The Server collects all keys, produces the results dictionary:
+
+        {key1: result, ..., keyN: result}
+
+
+    All communication between Server and Clients occurs asynchronously
+using the standard Python asyncore/asynchat library, and may be
+interspersed with user-defined communication in either direction,
+either from within the application's thread, or from an external
+thread.  Tools are provided to implement arbitrary synchronous events
+such as heartbeats, health checking, soft and hard communications
+shutdown.
+
+    API compatibility with Michael Fairley's original mincemeat.py
+from has been largely maintained:
+
+        http://remembersaurus.com/mincemeatpy/
+
+
 EXAMPLES
 
 Run the basic example with:
@@ -90,6 +141,114 @@ allowing a file name pattern (including "glob" wildcards) to be
 specified, and the matching files are word-counted.
 
     python example-sf-repr.py
+
+
+USAGE
+
+    Create an instance of mincemeat.Server, and set some attributes
+specifying the desired Map and Reduce functions and a datasource, and
+call the Server.run_server().  Start Client node(s).  They will
+connect to the Server, and begin receiving Map and then Reduce tasks.
+Finally, the Server will print the results.  See example*.py for
+details.
+
+* datasource
+
+    Present your input data in the dict-like form, where one or more
+keys each index a corpus of data.  You may use a dict, or any other
+data structure which implements the iterator protocol (__iter__() and
+next() )for returning all keys, and indexing (__getitem__() to return
+the data for each key.
+
+* mapfn
+
+    The Map function must accept 2 parameters, representing a name and
+the corpus of data.  It must return an iterator (or a generator) which
+yields (key, value) tuples from the data, which will be returned (as a
+dictionary) as the results of the Map phase.
+
+    The Map function is unique amongst the functions that the user
+must provide; it is the only one that must be implemented as an
+iterator returning (key, value) pairs.  For example, here's a mapfn
+that implements word counting (k is a filename, v is a corpus of
+text):
+
+    def get_lower_simple( k, v ):
+        for w in v.split():
+            yield w.lower(), 1
+
+    The Map phase always returns a dictionary where each key indexes a
+list [value, value, ...] of all values that where produced with that
+key.  So, at the end of the map phase, we'd see:
+
+    {'a': [1, 1, ..., 1], 'and': [1, 1, ..., 1], ...}
+
+returned to the server.  This works, but is sub-optimal for very large
+jobs; we might want to post-process the Map data in the client.  This
+is where the collectfn is used.
+
+* collectfn (optional)
+
+    If the (optional) collectfn is provided, it is applied (in the
+client) after the mapfn is done producing the raw Map (key,value)
+data.  The same function signatures are allowed as those used in the
+Reduce phase; a simple function taking key, [value, value], and
+returning a single value (just like reducefn and finishfn):
+
+    def sum_values( k, vs ):
+        return sum( vs )
+
+Or, it may be implemented as an iterator/generator taking (key,
+[value, ...]) and yielding (key, value):
+
+    def sum_values_generator( kvi ):
+        for k, vs in kvi:
+	    yield k, sum( vs )
+
+And for consistency, we allow collectfn to also return (key, [value,
+...]) pairs:
+
+    def sum_values_long( kvi ):
+        for k, vs in kvi:
+            yield k, vs if len(vs) < 10 else [sum(vs)]
+
+    The result of the Map phase is always (key, [value, ...]); the
+collectfn is allowed to return single values or lists; we will always
+wrap any non-list collectfn result value as [value].
+
+* reducefn
+
+    In the Reduce phase, the the Server send each key,[value, ...] to
+a Client, which reduces it to a key,value result, and sends it back.
+If this is trivial, you may decide to skip the Reduce phase
+altogether; just leave reducefn set to None.  We allow any function
+taking key,[value,...] and returning value:
+
+    function(k, vs) ==> v
+
+or taking an iterator yielding key,[value,...], and itself returing an
+iterable yielding key,value:
+
+    function(iter([(k, vs), ...])) ==> [(k, v), ...]
+
+
+* finishfn (optional)
+
+    After all the Map/Reduce is done, the Server runs the (optional)
+finishfn.  Trivial Reduce functions may be run on the Server (instead
+of sending them expensively to the Client), by using finishfn to run
+the Reduce function, instead of assigning it to reducefn.
+
+* resultfn (optional)
+
+    Fired by the Server as soon as results are available.  If not
+specified, the Server just collects up all results for later access.
+A function taking a transaction ID and results dictionary is required:
+
+    def resultfn(txn, results):
+        print "# Transaction ", txn
+        for k, v in results.iteritems():
+	    print k, ": ", v
 
 
 TOPOLOGY

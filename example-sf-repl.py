@@ -1,7 +1,10 @@
 #!/usr/bin/env python
-import mincemeat
+
+from __future__ import with_statement
+
 import collections
 import glob
+import itertools
 import logging
 import os
 import repr
@@ -14,6 +17,8 @@ import timeit
 import traceback
 import select
 import sys
+
+import mincemeat
 
 timer = timeit.default_timer # Platform-specific high-precision wall-clock timer
 
@@ -28,27 +33,121 @@ Each client may schedule Map-Reduce transactions to the Server, and
 receive the results of those transactions sometime in the future.  Of
 course, each Client also receives map and reduce tasks from the
 Server.
+
+    The default location of the files referenced for pattern matching is:
+in:
+        ../Gutenberg SF CD/Gutenberg SF/
+
+Obtain CD ISO from:
+
+        http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
+
+unzip it, create the following directory, and copy the CD's "Gutenberg
+SF" directory into it:
+
+         ../Gutenberg SF CD/
+
+    Or, point 'textbase' (below) to some other directory where you
+have some handy ASCII text data files:
 """
 
-class file_contents(object):
-    def __init__(self, pattern ):
-        self.text_files = glob.glob( pattern )
+textbase = ["..", "Gutenberg SF CD", "Gutenberg SF"]
 
+# 
+# Data Source.
+# 
+#     Provide key-index data for the Map/Reduce.  Typically a dict,
+# but any object satisfying the following requirements may be used.
+# Mincemeat requires unique keys (it uses them in some internal
+# record-keeping), but has no requirements on keys beyond that.  Each
+# (key, data) is passed to a Client as a Map task.
+# 
+#     Requires a dict-like object, where each key must uniquely index
+# a datum.  We require that the datasource satisfy the iterator
+# protocol (provide __iter__(), which returns an iterable object
+# having a next() returning unique keys), and at least the
+# __getitem__() method of the sequence protocol (len() is never used
+# on a datasource, so __len__() is optional)
+# 
+class file_contents(object):
+    """
+    For each filename matching the given pattern, iter(self) returns a
+    matching filename.  When indexed with a valid filename, returns
+    the file contents.
+    """
+    def __init__(self, pattern):
+        self.text_files = glob.glob( pattern )
     def __len__(self):
         return len(self.text_files)
-
     def __iter__(self):
         return iter(self.text_files)
-
     def __getitem__(self, key):
-        f = open(key)
-        try:
+        if key not in self.text_files:
+            raise IndexError
+        with open(key) as f:
             return f.read()
-        finally:
-            f.close()
 
-# Obtain CD ISO from: http://www.gutenberg.org/cdproject/pgsfcd-032007.zip.torrent
-datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
+class file_meta(object):
+    """
+    For each filename matching the given pattern, iter(self)
+    repeatedly returns the command you specified, prefixed with an
+    index number "#@".  When indexed with (any key), returns the file
+    name.  We use this to produce:
+
+        ("#@command", "some/file/path")
+
+    for the Map phase, when using our augmented get_lower_split:
+    """
+    def __init__(self, pattern, command):
+        self.text_files = glob.glob( pattern )
+        self.command = command
+    def __len__(self):
+        return len(self.text_files)
+    def __iter__(self):
+        """
+        Return a generator producing "##@command", sufficient to index
+        each self.text_file.
+        """
+        return ("%d@%s" % (i, self.command) for i in xrange(len(self)))
+    def __getitem__(self, key):
+        """
+        Index by # portion of "#@..." key.
+        """
+        off = key.find('@')
+        if off < 1:
+            raise IndexError
+        return self.text_files[int(key[0:off])]
+
+class repeat_command(object):
+    """
+    Simply repeat the given command as the key; data is always empty.
+    We don't implement the full sequence protocol (we don't know our
+    length, so provide no __len__()), but that's OK; len() is never
+    used.
+    
+    If the default times=None is used, then this object should be used
+    as a datasource only if TaskManager.ONESHOT is specified (send one
+    Map task to each Client).
+    """
+    def __init__(self, command, data="", times=None):
+        self.command = command
+        self.data = data
+        self.times = times
+    def __iter__(self):
+        """
+        Returns a generator expression yielding #@command strings,
+        optionally for the specified number of times.
+        """
+        # Contrary to "equivalent code" in documentation, providing
+        # None for times doesn't produce infinite itertools.repeat...
+        if self.times is None:
+            args = (self.command,)
+        else:
+            args = (self.command, self.times)
+        return ("%d@%s" % (idx, cmd) for idx, cmd in
+                enumerate(itertools.repeat(*args)))
+    def __getitem__(self, key):
+        return self.data
 
 # 
 # Map Functions.
@@ -57,8 +156,62 @@ datasource = file_contents( '../Gutenberg SF CD/Gutenberg SF/*.txt' )
 # (key,value) pairs.
 # 
 def get_lower_split( name, corpus ):
+    """
+    Accepts the name, corpus pair and runs a word count over it. 
+
+    Alternatively, accept a name of the form "##@command", paired with
+    some data, and evals the command portion.  Executes the result as
+    a function, on the provided data.  If the result is an iterable
+    producing (key, value) pairs, yields the results directly.
+    Otherwise, processes the results as the word-count corpus.
+
+
+    """
+    import re
     import string
-    logging.debug( "Corpus: %-40s: %d bytes" %( name, len( corpus )))
+
+    m = re.match(r"^(\d*)@(.*)$", name)
+    if m:
+        # We found an '#@...' (possibly with no #); Allow arbitrary
+        # anonymous functions to be evaluated; It's OK; Server is
+        # authenticated!
+        #
+        # We expect the code to evaluate to a function taking the
+        # corpus, and returning either a new corpus, or an iterable
+        # yielding (key, value).  For example, to open and read the
+        # file locally (instead of reading it at the Server, and
+        # transmitting it:
+        # 
+        #     123@lambda corpus: open(corpus).read()
+        # 
+        # To perform a (simpler) word count directly on the named
+        # corpus file:
+        # 
+        #     123@lambda corpus: ((word.lower(), 1) for word in open(corpus).read().split())
+        # 
+        # Or, to do something else entirely (assuming the code
+        # evaluated uses names that can be resolved in the context of
+        # the Client). For example, make up keys using enumerate (all
+        # Clients must agree on the keys!), and return arbitrary lists
+        # of data:
+        # 
+        #     @lambda corpus: enumerate( [ (socket.getfqdn(), os.name) ] )
+        # 
+        logging.info( "Evaluating: %-40s: %8d bytes: %s" %(
+                name, len( corpus ), repr.repr( corpus )))
+        output = eval( m.group(2) )( corpus )
+        try:
+            for k, v in output:
+                yield k, v
+            raise StopIteration
+        except ValueError:
+            # The result was NOT a (key, value) iterator!  Continue to
+            # process it as the text corpus.
+            corpus = output
+            pass
+
+    logging.info( "Processing: %-40s: %8d bytes: %s" %(
+                name, len( corpus ), repr.repr( corpus )))
     for line in corpus.split("\n"):
         for word in line.replace('--',' ').split():
             word = word.lower().strip(string.punctuation+
@@ -70,11 +223,12 @@ def get_lower_split( name, corpus ):
                         word = word[:-len( suffix )]
             if word:
                 yield word, 1
-
+    raise StopIteration
 
 def get_lower_simple( k, v ):
     for w in v.split():
         yield w.lower(), 1
+
 
 # 
 # Collect, Reduce, or Finish Functions.
@@ -151,10 +305,25 @@ mapfn = get_lower_split
 # differences in the results of the map (dramatically smaller returned
 # lists)
 
-#collectfn = None
-collectfn = sum_values
-#collectfn = sum_values_generator
+def sum_values_long( kvi ):
+    """
+    This collectfn just sums long lists, leaving shorter ones alone.
+    It is usable only as a collectfn, but not as a reducefn/finishfn.
 
+    The collectfn may also allows returning lists (unlike
+    reducfn/finishfn).  This is because the Map[/Collect] phase always
+    takes (arbitrary) name,data as input and results in
+    {key:[value,...],...}.  The Reduce[/Finish] phase takes
+    key,[value,...] as input and results in {key:value, ...}; no lists
+    are allowed in Reduce results.  
+    """
+    for k, vs in kvi:
+        yield k, vs if len(vs) < 10 else [sum(vs)]
+
+#collectfn = None
+#collectfn = sum_values
+#collectfn = sum_values_generator
+collectfn = sum_values_long
 
 # 
 # Reduce Phase
@@ -212,7 +381,7 @@ def store_results(txn, results):
 def server_results(txn, results, top=None):
     # Map-Reduce over 'datasource' complete.  Enumerate results,
     # ordered both lexicographically and by count
-    print "Transaction %s; %s%d results:" % (
+    print "Transaction %s; Word Count; %s%d results:" % (
         txn, ( top and "top %d of " % top or ""), len(results))
     # Collect lists of all words with each unique count
     bycount = {}
@@ -235,6 +404,15 @@ def server_results(txn, results, top=None):
                                    reverse=True),
                             reversed(bycountlist)):
         print "%8d %-40.40s %8d %s" % (results[wrd], wrd, cnt_wrd[0], cnt_wrd[1])
+
+def stats_results(txn, results):
+    # Collection of Stats from all Clients complete.
+    print "Transaction %s; Stats; %d results:" % (
+        txn, len(results))
+    for k, vs in results.iteritems():
+        for v in vs:
+            print "%-16s: %s" % (k, v)
+    sys.stdout.flush()
 
 # We'll provide a resultfn in our Server_Repl class...
 resultfn = None                 # None retains default behaviour
@@ -265,82 +443,18 @@ def logchange( who, previous ):
 # 
 #     Pass a 'timeout=#.#' to the constructor, and override the
 # timeout method; timeout wil be invoked by the daemon's service
-# thread at the specified interval.  To send commands; use
+# thread at the specified interval.  To send commands within timeout; use
 # send_command, NOT send_command_backchannel as required for external
 # thread initiated commands!
 # 
 
-class Cli(mincemeat.Client_daemon):
-
-    def timeout(self, done=False):
-        """
-        The Client_daemon's process (asyncore.loop) thread is invoking
-        us; use send_command; send_command_backchannel not necessary.
-
-        We just want to ensure our server is alive, and the
-        communications channel is open.  If we don't get a response
-        within a certain period, there will be... trouble.
-        """
-        if not done:
-            self.mincemeat.ping( allowed=30.0)
-
-class Client_Repl(mincemeat.Client):
+class Client_HB_Repl(mincemeat.Client_HB):
     """
-    A mincemeat.Client that knows how to process the "transactiondone"
-    response, containing the results of a previous "transaction"
-    command, sent by the REPL vai the Client, to the Server.
+    A mincemeat.Client_HB that knows how to process the
+    "transactiondone" response, containing the results of a previous
+    "transaction" command, sent by the REPL vai the Client, to the
+    Server.
     """
-    def __init__(self, *args, **kwargs):
-        mincemeat.Client.__init__(self, *args, **kwargs)
-        self.pingbeg = time.time()
-        self.pongtim = None             # time when pong received
-        self.pongtxn = None             # it's transaction
-
-    def ping(self, payload=None, now=None, allowed=None):
-        """
-        Send a ping command with a tell-tale time as the transaction
-        ID.  Allow a certain amount of delay before killing our
-        connection to the (crippled) server.
-
-        This method must be invoked (at least) often enough to ensure
-        that, under normal circumstances, the inter-ping latency, plus
-        any normal Server response delay, plus the round-trip trip
-        time does not exceed the allowed time.
-        """
-
-        # Check the last pong received.  Defaults to whenever we
-        # began.  If we exceed allowed, treat as a protocol failure
-        # (same as EOF).  Otherwise, send another ping.
-        now = time.time()
-        if self.pongtxn is not None:
-            delay, delaymsg = self.ping_delay(txn=self.pongtxn,
-                                              now=self.pongtim)
-            since, sincemsg = self.ping_delay(txn=self.pongtxn,
-                                              now=now)
-        else:
-            delay = 0.0
-            delaymsg = "?"
-            since = now - self.pingbeg
-            sincemsg = "%.3f s (no replies received)" % since
-
-        if since > allowed:
-            logging.warning("%s ping latency %s, last %s; Exceeds %.3fs allowed; disconnecting!" % (
-                self.name(), delaymsg, sincemsg, allowed))
-            self.handle_close()
-        else:
-            logging.info("%s ping latency %s, last %s < %s" % (
-                self.name(), delaymsg, sincemsg, allowed))
-            mincemeat.Client.ping(self, now=now)
-
-    def pong(self, command, data, txn):
-        """
-        Override the default pong, to remember the transaction numbers
-        of the ping responses we receive, and the time we received them.
-        """
-        self.pongtim = time.time()
-        self.pongtxn = txn
-        mincemeat.Client.pong(self, command, data, txn)
-
     def unrecognized_command(self, command, data=None, txn=None):
         """
         Store the results; let the main REPL thread detect and print them.
@@ -350,40 +464,40 @@ class Client_Repl(mincemeat.Client):
                 '/'.join( [command] + ( txn and [txn] or [])),
                 repr.repr(data)))
 
-        if command == "transactiondone":
+        if command in (
+            "transactiondone", 
+            "statsdone",
+            ):
             store_results(txn, data)
             return True
 
         return False
 
-
-class Svr(mincemeat.Server_daemon):
-
-    def timeout(self, done=False):
-        """
-        The Server_daemon's process (asyncore.loop) thread is invoking
-        us; it also runs all the Server's ServerChannel's; hence, we
-        use send_command, send_command_backchannel not necessary.
-
-        We don't have anything to do, but we set this up as an example.
-        """
-        logging.debug("%s Svr timeout %s" % (
-                self.name(), done and "done" or ""))
-
-
-class Server_Repl(mincemeat.Server):
+class Cli(mincemeat.Client_HB_daemon):
     """
-    A mincemeat.Server that knows how to process the "transaction"
-    command issued by a Client, coming in via our ServerChannel to
-    that client.
+    A Client w/HeartBeats daemon that knows about our REPL commands.
+    """
+    def __init__(self, credentials, cls=Client_HB_Repl,
+                 **kwargs):
+        mincemeat.Client_HB_daemon.__init__(self, credentials, cls=cls,
+                                            **kwargs)
 
-    We'll enqueue deque of tasks, where we'll remember the issuing
-    ServerChannel, and the (command, data, txn) tuple.  Later, after
-    the transaction is complete, we'll send back a "transactiondone"
-    via the same channel to the Client.
+
+class Server_HB_Repl(mincemeat.Server_HB):
+    """
+    A mincemeat.Server_HB that also knows how to process the
+    "transaction" and "stats" commands issued by our Client_REPL,
+    coming in via our ServerChannel to that client.
+
+    For each incoming command from our Client, we'll allocate a new,
+    unique Server Transaction ID, and enqueue a new datasource
+    of tasks, where we'll remember the issuing ServerChannel, and the
+    (command, data, txn) tuple.  Later, after the transaction is
+    complete, we'll send back a "transactiondone" via the same channel
+    to the Client.
     """
     def __init__(self, *args, **kwargs):
-        mincemeat.Server.__init__(self, *args, **kwargs)
+        mincemeat.Server_HB.__init__(self, *args, **kwargs)
         self.loctxn = 1000
         self.inflight = {}
 
@@ -398,30 +512,40 @@ class Server_Repl(mincemeat.Server):
         by the Client.  We'll map our txn back to the client's when
         returning the results.
         """
-        logging.info("%s received command via %s from peer %s: %s %s" % (
-                self.name(), chan.name(), str(chan.addr), 
+        # We MUST put in place the "in-flight" mapping of this local
+        # txn to the correspoding Client txn and channel, BEFORE we
+        # set the data source; if the datasource is empty, processing
+        # will be immediate (as set_datasource will jump-start the
+        # TaskManager, producing a call to resultfn directly),
+        # accessing self.inflight[loctxn])!
+        loctxn = str(self.loctxn)
+        self.loctxn += 1
+        self.inflight[loctxn] = {
+            'txn':          txn,
+            'chan':         chan,
+            'command':      command,
+            }
+
+        logging.info("%s txn %s (via %s from peer %s): %s %s" % (
+                self.name(), loctxn, chan.name(), str(chan.addr), 
                 '/'.join( [command] + ( txn and [txn] or [])),
                 repr.repr(data)))
 
         if command == "transaction":
-            path = os.path.join( "../Gutenberg SF CD/Gutenberg SF",
-                                 str(data))
-            data = file_contents( path )
-            loctxn = str(self.loctxn)
-            self.loctxn += 1
+            glob                = data
+            meta                = False
+            if glob.startswith('@'):
+                glob            = glob[1:]
+                meta            = True
+            path = os.path.join(*(textbase + [glob]))
+            if meta:
+                data            = file_meta( path,
+                    "lambda corpus: open(corpus).read()" )
+            else:
+                data            = file_contents( path )
 
-            # We MUST put in place the "in-flight" mapping of this
-            # local txn, to the correspoding Client txn and channel,
-            # BEFORE we set the data source; if the datasource is
-            # empty, processing will be immediate (as set_datasource
-            # will jump-start the TaskManager, producing a call to
-            # resultfn directly).
-            logging.warning("%s Map/Reduce txn %s: %s ==> %d files" % (
-                self.name(), loctxn, path, len(data)))
-            self.inflight[loctxn] = {
-                'txn':          txn,
-                'chan':         chan,
-                }
+            logging.warning("%s Map/Reduce %s ==> %d files" % (
+                self.name(), path, len(data)))
             self.set_datasource(
                 datasource      = data,
                 txn             = loctxn,
@@ -429,6 +553,23 @@ class Server_Repl(mincemeat.Server):
                 cycle           = mincemeat.TaskManager.PERMANENT )
             return True
 
+        if command == "stats":
+            logging.warning("%s Stats" % (
+                self.name()))
+            # This datasource is an unlimited iterator; only usable in ONESHOT
+            self.set_datasource(
+                datasource      = repeat_command(
+                    "lambda corpus: enumerate([(socket.getfqdn(), os.name)])"),
+                txn             = loctxn,
+                allocation      = mincemeat.TaskManager.ONESHOT,
+                cycle           = mincemeat.TaskManager.PERMANENT )
+            return True
+
+        # Command not recognized!  Kill inflight entry
+        logging.info("%s tnx %s: command %s unrecognized" % (
+                self.name(), loctxn,
+                '/'.join( [command] + ( txn and [txn] or []))))
+        del self.inflight[loctxn]
         return False
 
     def resultfn(self, txn, results):
@@ -443,12 +584,25 @@ class Server_Repl(mincemeat.Server):
             logging.warning("%s Map/Reduce txn %s: results via %s: %s" % (
                     self.name(), txn, client['chan'].name(),
                     repr.repr(results)))
-            client['chan'].send_command( "transactiondone", data=results,
+            client['chan'].send_command( client['command'] + "done", data=results,
                                          txn=client['txn'] )
         else:
             logging.error("%s unable to identify txn %s results in %s: %s" % (
                     self.name(), txn, repr.repr(self.inflight),
                     repr.repr(results)))
+
+
+class Svr(mincemeat.Server_HB_daemon):
+    """
+    A Server w/HeartBeats daemon that knows about our Client REPL commands.
+
+    Specify our custom mincemeat.Server* class; everything else passes
+    through unscathed; we use the default hearbeat timing parameters.
+    """
+    def __init__(self, credentials, cls=Server_HB_Repl,
+                 **kwargs):
+        mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls,
+                                            **kwargs)
 
 
 def REPL( cli ):
@@ -463,31 +617,39 @@ def REPL( cli ):
     txn = 0
     print "Which files?  eg. '*.txt<enter>'"
     while cli.is_alive():
-        print "GLOB> ",
+        sys.stdout.write( "GLOB> " )
+        sys.stdout.flush()
         try:
             inp = sys.stdin.readline()
         except:
             inp = None
+
         if inp:
             inp = inp.rstrip()
             if inp:
-                cli.mincemeat.send_command_backchannel("transaction", inp,
-                                                       txn=str(txn))
+                # A filename pattern?  Count some words.
+                cmd = "transaction"
             else:
-                # blank line
-                continue
+                # A Blank line.  Get some stats.
+                cmd = "stats"
+            cli.mincemeat.send_command_backchannel(
+                cmd, inp, txn=str(txn))
         else:
             # EOF
             break
-        txn += 1
 
         # Wait for results to appear, or client to die.
         while cli.is_alive() and not global_results:
-            time.sleep(.25)
+            time.sleep(.1)
 
         if global_results:
             args = global_results.popleft()
-            server_results(top=100, *args)
+            if cmd == "transaction":
+                server_results(top=100, *args)
+            elif cmd == "stats":
+                stats_results(*args)
+
+        txn += 1
     
 
 def main():
@@ -511,7 +673,7 @@ def main():
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = Cli(credentials, cls=Client_Repl, timeout=5.0)
+                    cli = Cli(credentials)
                     clista = logchange( cli, clista )
                     cli.start()
                     clista = logchange( cli, clista )
@@ -538,7 +700,7 @@ def main():
                 # Client didn't come up and/or didn't immediately
                 # authenticate.  Create a Server_Repl.
                 try:
-                    svr = Svr(credentials, cls=Server_Repl, timeout=5.0)
+                    svr = Svr(credentials)
                     svrsta = logchange( svr, svrsta )
                     svr.start()
                     svrsta = logchange( svr, svrsta )
@@ -609,5 +771,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.INFO )
+    logging.basicConfig( level=logging.WARNING )
     sys.exit(main())
