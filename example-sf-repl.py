@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-import mincemeat
+
+from __future__ import with_statement
+
 import collections
 import glob
 import itertools
@@ -15,6 +17,8 @@ import timeit
 import traceback
 import select
 import sys
+
+import mincemeat
 
 timer = timeit.default_timer # Platform-specific high-precision wall-clock timer
 
@@ -444,94 +448,13 @@ def logchange( who, previous ):
 # thread initiated commands!
 # 
 
-class Cli(mincemeat.Client_daemon):
-
-    def process(self, allowed=None, *args, **kwargs):
-        """
-        Trap an "allowed=#" kwarg passed to mincemeat.*_daemon.__init__().
-        """
-        self.allowed = allowed
-        mincemeat.Client_daemon.process(self, *args, **kwargs)
-
-    def timeout(self, done=False):
-        """
-        The Client_daemon's process (asyncore.loop) thread is invoking
-        us; use send_command; send_command_backchannel not necessary.
-
-        We just want to ensure our server is alive, and the
-        communications channel is open.  If we don't get a response
-        within a certain period, there will be... trouble.
-        """
-        if not done:
-            self.mincemeat.ping(self.allowed)
-
-
-class Client_Repl(mincemeat.Client):
+class Client_HB_Repl(mincemeat.Client_HB):
     """
-    A mincemeat.Client that knows how to process the "transactiondone"
-    response, containing the results of a previous "transaction"
-    command, sent by the REPL vai the Client, to the Server.
-
-    Override process here, to trap kwargs via *_daemon.__init__,
-    *_daemon.process, and finally to Client.process.  This allows all
-    keyword options classes derived from either mincemeat.*_daemon OR
-    mincemeat.Client/.Server, to be passed to the derived
-    *_daemon.__init__()!
+    A mincemeat.Client_HB that knows how to process the
+    "transactiondone" response, containing the results of a previous
+    "transaction" command, sent by the REPL vai the Client, to the
+    Server.
     """
-    def __init__(self, *args, **kwargs):
-        mincemeat.Client.__init__(self, *args, **kwargs)
-        self.pingbeg = time.time()
-        self.pongtim = None             # time when pong received
-        self.pongtxn = None             # it's transaction
-
-    def ping(self, allowed=None):
-        """
-        Send a ping command to our Server, with a tell-tale time as
-        the transaction ID (this is the default ping behavior).  Allow
-        a certain amount of delay before killing our connection to the
-        (crippled) server.
-
-        This method must be invoked (at least) often enough to ensure
-        that, under normal circumstances, the inter-ping latency, plus
-        any normal Server response delay, plus the round-trip trip
-        time does not exceed the allowed time.
-        """
-        # Check the last pong received.  Defaults to whenever we
-        # began.  If we exceed allowed, treat as a protocol failure
-        # (same as EOF).  Otherwise, send another ping.
-        now = time.time()
-        if self.pongtxn is not None:
-            # We note that a pong has been received.  Compute the
-            # actual ping latency, and also how long since it was
-            # seen.
-            delay, delaymsg = self.ping_delay(txn=self.pongtxn,
-                                              now=self.pongtim)
-            since, sincemsg = self.ping_delay(txn=self.pongtxn,
-                                              now=now)
-        else:
-            delay = 0.0
-            delaymsg = "?"
-            since = now - self.pingbeg
-            sincemsg = "%.3f s (no replies received)" % since
-
-        if allowed is not None and since > allowed:
-            logging.warning("%s ping latency %s, last %s; Exceeds %.3fs allowed; disconnecting!" % (
-                self.name(), delaymsg, sincemsg, allowed))
-            self.handle_close()
-        else:
-            logging.info("%s ping latency %s, last %s <= %s" % (
-                self.name(), delaymsg, sincemsg, allowed))
-            mincemeat.Client.ping(self, now=now)
-
-    def pong(self, command, data, txn):
-        """
-        Override the default pong, to remember the transaction numbers
-        of the ping responses we receive, and the time we received them.
-        """
-        self.pongtim = time.time()
-        self.pongtxn = txn
-        mincemeat.Client.pong(self, command, data, txn)
-
     def unrecognized_command(self, command, data=None, txn=None):
         """
         Store the results; let the main REPL thread detect and print them.
@@ -550,46 +473,30 @@ class Client_Repl(mincemeat.Client):
 
         return False
 
-
-class Svr(mincemeat.Server_daemon):
-
-    def process(self, allowed=None, *args, **kwargs):
-        """
-        Trap an "allowed=#" kwarg passed to mincemeat.*_daemon.__init__().
-        """
-        self.allowed = allowed
-        mincemeat.Server_daemon.process(self, *args, **kwargs)
-        
-    def timeout(self, done=False):
-        """
-        The Server_daemon's process (asyncore.loop) thread is invoking
-        us; it also runs all the Server's ServerChannel's; hence, we
-        use send_command, send_command_backchannel not necessary.
-
-        We have a number of channels open to Clients.  We want to
-        ensure that each Client remains responsive.  This means
-        sending a ping to each, ensuring a timely response.
-        """
-        if not done:
-            self.mincemeat.ping(self.allowed)
-
-
-class Server_Repl(mincemeat.Server):
+class Cli(mincemeat.Client_HB_daemon):
     """
-    A mincemeat.Server that knows how to process the "transaction"
-    command issued by a Client, coming in via our ServerChannel to
-    that client.
+    A Client w/HeartBeats daemon that knows about our REPL commands.
+    """
+    def __init__(self, credentials, cls=Client_HB_Repl, **kwargs):
+        mincemeat.Client_HB_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
-    We'll enqueue deque of tasks, where we'll remember the issuing
-    ServerChannel, and the (command, data, txn) tuple.  Later, after
-    the transaction is complete, we'll send back a "transactiondone"
-    via the same channel to the Client.
+class Server_HB_Repl(mincemeat.Server_HB):
+    """
+    A mincemeat.Server_HB that also knows how to process the
+    "transaction" and "stats" commands issued by our Client_REPL,
+    coming in via our ServerChannel to that client.
+
+    For each incoming command from our Client, we'll allocate a new,
+    unique Server Transaction ID, and enqueue a new datasource
+    of tasks, where we'll remember the issuing ServerChannel, and the
+    (command, data, txn) tuple.  Later, after the transaction is
+    complete, we'll send back a "transactiondone" via the same channel
+    to the Client.
     """
     def __init__(self, *args, **kwargs):
-        mincemeat.Server.__init__(self, *args, **kwargs)
+        mincemeat.Server_HB.__init__(self, *args, **kwargs)
         self.loctxn = 1000
         self.inflight = {}
-        self.pongseen = {}	# When last pong seen from Client
 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
@@ -681,41 +588,16 @@ class Server_Repl(mincemeat.Server):
                     self.name(), txn, repr.repr(self.inflight),
                     repr.repr(results)))
 
-    def ping(self, allowed=None):
-        """
-        Override mincemeat.Server.ping to check that we've received a
-        pong from all Clients, and kill any ServerChannels to
-        (apparenly) dead Clients.  Retain the default behavior, which
-        is to send a ping to all Clients via their ServerChannel.
+class Svr(mincemeat.Server_HB_daemon):
+    """
+    A Server w/HeartBeats daemon that knows about our Client REPL commands.
 
-        We'll traverse all the Server's known channels; the first time
-        we encounter a channel, we'll default to believing we've just
-        seen a pong from it's Client (given it the full allowed
-        timeout to comply).
+    Specify our custom mincemeat.Server* class; everything else passes
+    through unscathed; we use the default hearbeat timing parameters.
+    """
+    def __init__(self, credentials, cls=Server_HB_Repl, **kwargs):
+        mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls, **kwargs)
 
-        As soon as the last pong seen time exceeds allowed seconds
-        ago, we'll kill the channel.
-        """
-        now = time.time()
-        for chan in self.taskmanager.channels.keys():
-            last = self.pongseen.setdefault(chan, time.time())
-            if allowed is not None and last + allowed < now:
-                logging.warning("%s pong timeout  from %s; disconnecting" % (
-                        self.name(), chan.name()))
-                chan.handle_close()
-            else:
-                logging.info(   "%s pong response from %s, %s s ago" % (
-                        self.name(), chan.name(), now - last))
-
-        mincemeat.Server.ping(self)
-
-    def pong(self, chan, command, data, txn):
-        """
-        Override mincemeat.Server.pong to just remember when we last
-        saw a pong from this channel.
-        """
-        self.pongseen[chan] = time.time()
-        mincemeat.Server.pong(self, chan, command, data, txn)
 
 def REPL( cli ):
     """
@@ -785,8 +667,7 @@ def main():
                 # immediately, if non-blocking connect is unusually
                 # fast...
                 try:
-                    cli = Cli(credentials, cls=Client_Repl,
-                              timeout=15.0, allowed=65.0)
+                    cli = Cli(credentials)
                     clista = logchange( cli, clista )
                     cli.start()
                     clista = logchange( cli, clista )
@@ -813,8 +694,7 @@ def main():
                 # Client didn't come up and/or didn't immediately
                 # authenticate.  Create a Server_Repl.
                 try:
-                    svr = Svr(credentials, cls=Server_Repl,
-                              timeout=15.0, allowed=65.0)
+                    svr = Svr(credentials)
                     svrsta = logchange( svr, svrsta )
                     svr.start()
                     svrsta = logchange( svr, svrsta )
