@@ -443,7 +443,7 @@ def logchange( who, previous ):
 # 
 #     Pass a 'timeout=#.#' to the constructor, and override the
 # timeout method; timeout wil be invoked by the daemon's service
-# thread at the specified interval.  To send commands; use
+# thread at the specified interval.  To send commands within timeout; use
 # send_command, NOT send_command_backchannel as required for external
 # thread initiated commands!
 # 
@@ -477,8 +477,11 @@ class Cli(mincemeat.Client_HB_daemon):
     """
     A Client w/HeartBeats daemon that knows about our REPL commands.
     """
-    def __init__(self, credentials, cls=Client_HB_Repl, **kwargs):
-        mincemeat.Client_HB_daemon.__init__(self, credentials, cls=cls, **kwargs)
+    def __init__(self, credentials, cls=Client_HB_Repl,
+                 **kwargs):
+        mincemeat.Client_HB_daemon.__init__(self, credentials, cls=cls,
+                                            **kwargs)
+
 
 class Server_HB_Repl(mincemeat.Server_HB):
     """
@@ -529,17 +532,17 @@ class Server_HB_Repl(mincemeat.Server_HB):
                 repr.repr(data)))
 
         if command == "transaction":
-            glob 		= data
-            meta 		= False
+            glob                = data
+            meta                = False
             if glob.startswith('@'):
-                glob		= glob[1:]
-                meta 		= True
+                glob            = glob[1:]
+                meta            = True
             path = os.path.join(*(textbase + [glob]))
             if meta:
-                data		= file_meta( path,
+                data            = file_meta( path,
                     "lambda corpus: open(corpus).read()" )
             else:
-                data		= file_contents( path )
+                data            = file_contents( path )
 
             logging.warning("%s Map/Reduce %s ==> %d files" % (
                 self.name(), path, len(data)))
@@ -588,6 +591,7 @@ class Server_HB_Repl(mincemeat.Server_HB):
                     self.name(), txn, repr.repr(self.inflight),
                     repr.repr(results)))
 
+
 class Svr(mincemeat.Server_HB_daemon):
     """
     A Server w/HeartBeats daemon that knows about our Client REPL commands.
@@ -595,8 +599,10 @@ class Svr(mincemeat.Server_HB_daemon):
     Specify our custom mincemeat.Server* class; everything else passes
     through unscathed; we use the default hearbeat timing parameters.
     """
-    def __init__(self, credentials, cls=Server_HB_Repl, **kwargs):
-        mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls, **kwargs)
+    def __init__(self, credentials, cls=Server_HB_Repl,
+                 **kwargs):
+        mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls,
+                                            **kwargs)
 
 
 def REPL( cli ):

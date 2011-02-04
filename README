@@ -45,6 +45,20 @@ for one key to each Client:
         {key1: result, ..., keyN: result}
 
 
+    All communication between Server and Clients occurs asynchronously
+using the standard Python asyncore/asynchat library, and may be
+interspersed with user-defined communication in either direction,
+either from within the application's thread, or from an external
+thread.  Tools are provided to implement arbitrary synchronous events
+such as heartbeats, health checking, soft and hard communications
+shutdown.
+
+    API compatibility with Michael Fairley's original mincemeat.py
+from has been largely maintained:
+
+        http://remembersaurus.com/mincemeatpy/
+
+
 EXAMPLES
 
 Run the basic example with:

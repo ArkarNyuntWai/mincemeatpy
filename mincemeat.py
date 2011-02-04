@@ -95,6 +95,18 @@ def applyover(func, itr):
     except TypeError:
         return generator(func)(itr)
 
+
+# ##########################################################################
+# 
+# process               -- asyncore event loop, with synchronous scheduling
+# 
+#     Implements the traditional asyncore.loop processing loop
+# supporting arbitrary numbers of asyncore.dispatcher and/or
+# asynchat.async_chat based objects sharing a single socket map.
+# 
+#     Also implements auto-firing scheduled events (one-shot or
+# repeating), while respecting the (optional) caller-defined timeout.
+# 
 def process(timeout=None, map=None, schedule=None):
     """
     Processes asyncore based Server or Client events 'til none left
@@ -134,67 +146,85 @@ def process(timeout=None, map=None, schedule=None):
     each event) another scheduled event was added, it will influence
     the timeout of the next invocation.  It is recommended that a
     thread-safe container like collections.deque is used, if multiple
-    threads may schedule events.  All events are of the form
-    (expiry,callable), where expiry is a timer() value, and callable
-    is any callable (normally, a bound method of an
-    asyncore.dispatcher based object)
+    threads may schedule events.
+    
+    All schedule events are of the form (expiry,callable,repeat),
+    where expiry is a timer() value, and callable is any callable
+    (normally, a bound method of an asyncore.dispatcher based object),
+    and repeat is a number of seconds (or None)
     """
     try:
         if map is None:
             map = asyncore.socket_map           # Internal asyncore knowledge!
 
         beg = now = timer()
-        dur = 0.0
-        while map and (timeout is None or dur <= timeout):
+        dur = -1.
+        while map and (timeout is None or dur < timeout):
             # Events on 'map' still possible, and either 'timeout' is
-            # infinite, or we haven't yet exceeded it.  NOTE: We
+            # infinite, or we haven't yet reached it.  NOTE: We
             # *always* want to do at least one cycle, even if timeout
-            # == 0, hence the <= instead of <.
+            # == 0, hence the initial dur = -1
+            remains = [] # Append any potential new expiries created during loop
             exp = None
             if schedule:
                 # Dispatch expired scheduled events.  Any scheduled
                 # events remaining after 'map' is empty (all sockets
                 # closed) will never be fired!
-                for exp,fun in sorted(schedule):
+                for exp,fun,rpt in sorted(schedule):
                     try:
                         if now >= exp:
-                            logging.info("%s expired; Firing %r" % (exp, fun))
+                            logging.debug("Firing scheduled event %s (repeat: %s)" % (
+                                    '.'.join( [] if not hasattr(fun, "im_class") 
+                                              else [fun.im_class.__name__]
+                                              + [fun.__name__]), rpt))
                             fun()               # Timer expired; fire fun()!
                         else:
                             break               # Timer in future; done.
                     except Exception, e:
                         # A scheduled event failed; this isn't
                         # considered fatal, but may be of interest...
-                        logging.warning("Failed scheduled event %s: %s" % (
-                                fun, e))
+                        logging.warning("Failed scheduled event %s: %s\n%s" % (
+                                fun, e, traceback.format_exc()))
                 
                     # This event was at or before now (and was fired);
                     # remove it and get next one (if any).  We'll
                     # always refresh 'now' after every fun() firing,
                     # b/c arbitrary time has elapsed.
-                    schedule.remove((exp,fun))
+                    schedule.remove((exp,fun,rpt))
                     now = timer()
+                    if rpt:
+                        # Careful re-schedule the event.  If we've
+                        # already missed one (or more) timeouts, log
+                        # and re-schedule for the next multiple of
+                        # repeat still in the future.
+                        mis = int((now - exp) / rpt)
+                        if mis:
+                            logging.warning("Missed %d firings of schedule event %s" % (
+                                    mis, fun))
+                        exp += (mis + 1) * rpt
+                        remains.append(exp - now)
+                        schedule.append((exp, fun, rpt))
                     exp = None
             
             # Done firing any expired events.  The expiry 'exp' of the
             # one that fired the break (if any) will limit expiry
             # timeout; 'now' is recently refreshed.  Deduce time that
-            # 'remains'; None means no timeout.
+            # remains; None means no timeout.
             dur = now - beg
-            rem = []
             if exp is not None:                 # A (finite) event awaits...
-                rem.append(exp - now)
+                remains.append(exp - now)
             if timeout is not None:             # A (finite) timeout defined...
-                rem.append(timeout - dur)
+                remains.append(timeout - dur)
             # Convert durations list to scalar minimum, None for inf.
-            if rem:
-                rem = min(rem)
+            if remains:
+                remains = min(remains)
             else:
-                rem = None
-            #logging.debug("asyncore.loop map %s, dur: %f, rem: %f, timeout: %s" % (
-            #        repr.repr(map), dur, rem, timeout))
+                remains = None
+            logging.debug("asyncore.loop %d sock., dur: %3.6f, remains: %3.7f of timeout: %s" % (
+                    len(map), dur,
+                    remains if remains is not None else float("inf"), timeout))
 
-            asyncore.loop(timeout=rem, map=map, count=1)
+            asyncore.loop(timeout=remains, map=map, count=1)
             now = timer()
             dur = now - beg
 
@@ -238,7 +268,7 @@ def close_all(map=None, ignore_all=False):
             logging.warning("Pre-2.6 asyncore; socket map cleanup incomplete: %s" % (e))
     
 
-# ############################################################################
+# ##########################################################################
 # 
 # Mincemeat_class       -- Interface required by _daemon
 # Mincemeat_daemon      -- Standard daemon Thread fo Client or Server
@@ -246,7 +276,7 @@ def close_all(map=None, ignore_all=False):
 class Mincemeat_class(object):
     """
     The default API for a target class of a Mincemeat_daemon.  No
-    __init__ (takes no args).
+__init__ (takes no args).
 
     The normal phases the *_daemon will take us thru is:
 
@@ -266,14 +296,28 @@ class Mincemeat_class(object):
      | stopping    -- invoked once after no more events pending
      v
 
+
     """
     def starting(self, *args, **kwargs):
         """
         Invoked at the daemon Thread start-up, with all the (optional)
         keyword args.
+
+        Responds to the following keywords:
+        
+            interval    -- schedules self.ping on the specified repeat interval
+        
         """
         logging.info("%s starting: %s, %s" % ( 
                 self.name(), repr.repr(args), repr.repr(kwargs)))
+
+        interval = kwargs.get("interval", None)
+        if interval:
+            logging.info("%s scheduling ping every %s seconds" % (
+                    self.name(), interval))
+            self.schedule.append((timer() + interval,
+                                  self.ping,
+                                  interval))
 
     def process(self, timeout=None):
         """
@@ -300,7 +344,7 @@ class Mincemeat_class(object):
         Return a desired numeric timeout, in seconds; it will be used
         to shorten the intended timeout.  None implies no shorter
         timeout desired.  The pattern that overriding methods should
-        follow is for computing shortened timeouts is:
+        follow for computing shortened timeouts is:
         """
         shorten = None
 
@@ -321,8 +365,9 @@ class Mincemeat_class(object):
         May be used to implement health checks (some of supplied
         *_daemon implementations do so).
 
-        Should check health, and return a timeout 'til the next
-        desired health check (default None implies none desired).
+        Should check health, and return a desired timeout 'til the
+        next desired health check (default None implies no target
+        timeout desired).
         """
         pass
 
@@ -337,7 +382,7 @@ class Mincemeat_class(object):
 class Mincemeat_daemon(threading.Thread):
     """
     A mincemeat Map/Reduce Client or Server daemon thread.  A non-None
-    numeric 'timeout=' keyword arg creation will cause timeout() to be
+    numeric timeout= keyword arg creation will cause timeout() to be
     fired at least every about that many seconds.  By default,
     allocates a private asyncore socket map, so we can process async
     I/O events using a separate thread from any other asyncore derived
@@ -345,8 +390,8 @@ class Mincemeat_daemon(threading.Thread):
 
     Note that an overridden Thread.run method does *not* receive the
     args= or kwargs= passed to threading.Thread.__init__; Only a
-    target=... method does.  This appears to be a Python
-    threading.Thread defect (or at least a documentation oversight).
+    target=... method invoked by the default run() does!  This is not
+    overly clear in the Python threading.Thread documentation.
 
     Raises exception on the Server's failure to bind, or a Client's
     failure to connect.
@@ -396,6 +441,10 @@ class Mincemeat_daemon(threading.Thread):
         keyword arguments are passed to the target mincemeat Server or
         Client.starting(...) method.
 
+        Responds to the following keywords:
+        
+            timeout     -- the longest interval between invocations of timeout()
+
         Invokes the process() method in the mincemeat Client or
         Server.  Any extraneous arguments passed to the constructor
         are assumed to be arguments passed to Client or
@@ -411,7 +460,7 @@ class Mincemeat_daemon(threading.Thread):
         never be fired, until the very end (with done=True).
 
         If timeout() is overriden in derived class, pass a timeout=#
-        keyword arg to class consructor to implement a timed
+        keyword arg to class constructor to implement a timed
         event-loop.  Then, timeout() will fire at least every timeout=
         seconds; if timeout returns a smaller numeric value, this will
         be used to reduce the next timeout interval.
@@ -420,19 +469,20 @@ class Mincemeat_daemon(threading.Thread):
                 self.name(), repr.repr(kwargs)))
         self._state = "processing"
 
-        # Pull 'timeout' out of the keyword args (None if unspecified)
         try:
             self.mincemeat.starting(**kwargs)
 
+            # Pull 'timeout' out of the keyword args (None if
+            # unspecified) If non-None, we'll kick things off with an
+            # immediate timeout, before proceeding with the default.
+            # This allows us to specify very large timeout, if we know
+            # that we'll primarily be depending on our timeout service
+            # routines to "shorten" it.
             timeout = kwargs.get('timeout', None)
-            shorten = timeout
-
+            shorten = timeout if timeout is None else 0.0
             while self.mincemeat.process(timeout=shorten):
                 shorten = timeout
                 requested = self.timeout()
-                if shorten is None or (requested is not None and requested < shorten):
-                    shorten = requested
-                requested = self.mincemeat.timeout()
                 if shorten is None or (requested is not None and requested < shorten):
                     shorten = requested
                 
@@ -457,12 +507,22 @@ class Mincemeat_daemon(threading.Thread):
         a timed event-loop is desired.  It is invoked at every timeout
         until the event loop detects completion.
 
+        Remember to invoke this base-class method, if you wish to
+        chain timeout() invocations into the mincemeat.Client/Server
+        (ie. to allow it to implement health checks, etc)!
+
         May optionally return a numeric value; it will be used to
         specify a shorter desired timeout, in seconds. Returning None
         means that the standard timeout (the timeout= keyword passed
         to __init__) will be applied.
         """
-        pass
+        shorten = None
+
+        requested = self.mincemeat.timeout()
+        if shorten is None or (requested is not None and requested < shorten):
+            shorten = requested
+
+        return shorten
 
     def stop(self, timeout=5.):
         """
@@ -482,10 +542,12 @@ class Mincemeat_daemon(threading.Thread):
         # Still not dead?  Some client must be frozen.  Try harder.
         if self.is_alive():
             close_all(map=self.mincemeat._map, ignore_all=True)
-            self.join()
+            self.join(0.)
 
-
-
+# ##########################################################################
+# 
+# threaded_async_chat   -- threadsafe asynchat interface, pre-2.6 compatible
+# 
 class threaded_async_chat(asynchat.async_chat):
     """
     Support multithreaded access to pushing data for transmission on
@@ -628,11 +690,11 @@ class threaded_async_chat(asynchat.async_chat):
                                         timeout and timeout - elapsed or timeout)
                 if e:
                     self.handle_expt()
-            except select.error, err:
+            except select.error, e:
                 # Anything that wakes us up harshly will wake up the
                 # main loop's select.  Done (except ignore
                 # well-behaved interrupted system calls).
-                if err.arg[0] != errno.EINTR:
+                if e.arg[0] != errno.EINTR:
                     break
 
     def tidy_close(self):
@@ -906,7 +968,7 @@ class Protocol(threaded_async_chat):
     # protocol.  They are invoked by the asyncore.loop thread due to
     # I/O events detected on this socket, and invoke the appropriate
     # callbacks as commands are received.
-
+    # 
     def log_info(self, message, type):
         """
         The asyncore.dispatcher.log_info type='name' categorization
@@ -1000,7 +1062,8 @@ class Protocol(threaded_async_chat):
             # We performed a tidy close!  Schedule a real close, in
             # case it doesn't flow through...
             self.schedule.append((timer() + self.shuttout, 
-                                   self.handle_close))
+                                  self.handle_close,
+                                  None))
         else:
             # Already did a shutdown, no connection timeouts, or no
             # schedule to handle them, or an exception while
@@ -1029,7 +1092,7 @@ class Protocol(threaded_async_chat):
     # respond_to_challenge may actually be either an authenticated OR
     # an un-authenticated commadn (depending on who demanded auth
     # first).
-
+    # 
     def send_challenge(self):
         logging.debug("%s -- send_challenge" % self.name())
         self.auth = os.urandom(20).encode("hex")
@@ -1068,7 +1131,7 @@ class Protocol(threaded_async_chat):
     # 
     #      After both ends of the channel have authenticated eachother, they may
     # then use these commands.
-
+    # 
     def ping(self, message=None, payload=None, now=None):
         """
         Send a standard "ping", carrying the given payload, and 
@@ -1187,7 +1250,7 @@ class Protocol(threaded_async_chat):
     #     After authentication, the protocol allows for functions and
     # simple closures to be marshalled and transmitted.  These methods
     # are used to dump and reconstitute methods.
-
+    # 
     def store_func(self, fun):
         """
         Pickle up simple, self-contained functions and closures (or
@@ -1249,7 +1312,7 @@ class Client(Protocol, Mincemeat_class):
 
     # ----------------------------------------------------------------------
     # Methods required by Mincemeat_daemon
-
+    # 
     def finished(self):
         return self.shutdown is True
 
@@ -1292,7 +1355,7 @@ class Client(Protocol, Mincemeat_class):
 
     # ----------------------------------------------------------------------
     # Protocol command processing
-
+    # 
     def set_mapfn(self, command, mapfn, txn):
         self.mapfn = self.load_func(mapfn, globals())
 
@@ -1511,7 +1574,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
     # ----------------------------------------------------------------------
     # Methods required by Mincemeat_daemon
-
+    # 
     def finished(self):
         """
         Detect if finished (either completely, or a Transaction), by
@@ -1652,7 +1715,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
     # ----------------------------------------------------------------------
     # overridden asyncore.dispatcher methods
-
+    # 
     def log_info(self, message, type):
         getattr(logging,type)(message)
 
@@ -1677,12 +1740,12 @@ class Server(asyncore.dispatcher, Mincemeat_class):
             # In Python 2.7+, asyncore.dispatcher.accept is improved,
             # but may still return just None.
             return
-        except socket.error, err:
+        except socket.error, e:
             # ECONNABORTED might be thrown on *BSD (see issue 105). 
             # In Python 2.7+, this is handled (returns None).
-            if err[0] != errno.ECONNABORTED:
+            if e[0] != errno.ECONNABORTED:
                 logging.warning("Unhandled socket error on accept: %s\n%s" % (
-                    err, traceback.format_exc()))
+                    e, traceback.format_exc()))
             return
         else:
             # sometimes addr == None instead of (ip, port) (see issue 104)
@@ -1732,7 +1795,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     # mincemeat.py.  We've split out the connection related
     # functionality into the conn() method required by
     # Mincemeat_daemon, but retain the original API.
-
+    # 
     def run_server(self, password="", port=DEFAULT_PORT, interface="",
                    asynchronous=False):
         """
@@ -1816,7 +1879,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
     # ----------------------------------------------------------------------
     # Protocol command processing (hooks invoked by our ServerChannels)
-
+    # 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
         Process a command, if possible, from the specified
@@ -1913,7 +1976,7 @@ class ServerChannel(Protocol):
 
     # ----------------------------------------------------------------------
     # Protocol command processing (hooks invoked by our ServerChannels)
-
+    # 
     def map_done(self, command, data, txn):
         self.server.taskmanager.channel_process(self, command, data, txn)
         self.server.taskmanager.map_done(data, txn)
@@ -2011,16 +2074,16 @@ class TaskManager(object):
     FINISHED    = 5             # Final results available; loop or quit
 
     statename = {
-        IDLE:		"Idle",
-        START:  	"Starting",
+        IDLE:           "Idle",
+        START:          "Starting",
         MAPPING:        "Mapping",
-        REDUCING:	"Reducing",
-        FINISHING:	"Finishing",
-        FINISHED:	"Finished",
+        REDUCING:       "Reducing",
+        FINISHING:      "Finishing",
+        FINISHED:       "Finished",
         }
     statecommand = {
         MAPPING:        "map",
-        REDUCING:	"reduce",
+        REDUCING:       "reduce",
         }
     
     # Possible .tasks option
@@ -2028,9 +2091,9 @@ class TaskManager(object):
     MAPONLY     = 1             # Only perform the Map phase
     REDUCEONLY  = 2             # Only perform the Reduce phase
     tasksname = {
-        MAPREDUCE:	"Map/Reduce",
-        MAPONLY:	"Skip Reduce",
-        REDUCEONLY:	"Skip Map",
+        MAPREDUCE:      "Map/Reduce",
+        MAPONLY:        "Skip Reduce",
+        REDUCEONLY:     "Skip Map",
         }
 
     # Possible .allocation option
@@ -2060,8 +2123,8 @@ class TaskManager(object):
             "datasource":       None,           # If None, TaskManager will idle
             "txn":              None,           # Currently running Transaction
             "allocation":       self.CONTINUOUS,# Allocate tasks 'til datasource empty
-            "cycle":            self.SINGLEUSE,	# Shut down Server when complete
-            "retransmit":	5,		# Retransmit re-work to 5% of channels
+            "cycle":            self.SINGLEUSE, # Shut down Server when complete
+            "retransmit":       5,              # Retransmit re-work to 5% of channels
             }
 
         self.server = server
@@ -2160,7 +2223,7 @@ class TaskManager(object):
         """
         for chan, activity in list(self.channels.items()):
             if activity is None:
-                logging.info("%s jump-starting %s" % (
+                logging.debug("%s jump-starting %s" % (
                         self.server.name(), chan.name()))
                 chan.start_new_task()
                 if count:
@@ -2450,7 +2513,7 @@ class TaskManager(object):
         del self.work[data[0]]
 
 
-# ############################################################################
+# ##########################################################################
 # 
 # Client_daemon         -- Standard Client daemon Thread
 # Server_daemon         -- Standard Server daemon Thread
@@ -2463,7 +2526,6 @@ class TaskManager(object):
 # optionally as an independent asynchronous I/O processing daemon
 # Thread.
 # 
-
 class Client_daemon(Mincemeat_daemon):
     """
     Start a mincemeat.Client (by default), as a daemon Thread.
@@ -2515,19 +2577,28 @@ class Server_daemon(Mincemeat_daemon):
 
 class Server_HB(Server):
     """
-    Monitor the Server's Client channels with heartbeats.
+    Monitor the Server's Client channel heartbeats.
     """
     def __init__(self, *args, **kwargs):
         Server.__init__(self, *args, **kwargs)
         self.pongseen = {}
 
     def starting(self, *args, **kwargs):
+        """
+        Responds to the following keywords:
+        
+            "allowed"   -- must see responses to self.ping within allowed interval
+
+        """
         self.allowed = kwargs.get('allowed', None)
+        if self.allowed is not None:
+            logging.info("%s allowing %.3f s between pongs" % (
+                    self.name(), self.allowed))
         Server.starting(self, *args, **kwargs)
 
     def health(self):
         """
-        Override mincemeat.Server.ping to check that we've received a
+        Override mincemeat.Server.health to check that we've received a
         pong from all Clients, and kill any ServerChannels to
         (apparenly) dead Clients.  Retain the default behavior, which
         is to send a ping to all Clients via their ServerChannel.
@@ -2548,17 +2619,24 @@ class Server_HB(Server):
                 last = self.pongseen.setdefault(chan, now)
                 since = now - last
                 if since > self.allowed:
-                    logging.warning("%s pong timeout  from %s; disconnecting" % (
+                    logging.warning("%s ping timeout  from %s; unhealthy Client; disconnecting!" % (
                             self.name(), chan.name()))
                     chan.handle_close()
                 else:
-                    logging.info(   "%s pong response from %s, %s s ago" % (
+                    logging.debug(   "%s ping response from %s, %.3f s ago" % (
                             self.name(), chan.name(), now - last))
                     requested = self.allowed - since
                     if shorten is None or (requested is not None and requested < shorten):
                         shorten = requested
-                
-        return shorten
+                        shortest = chan
+
+        if shorten is not None:
+            logging.debug("%s needs to see a ping response from %s within %.3f s" % (
+                            self.name(), shortest.name(), shorten ))
+
+        # We must return at most self.allowed from now, even if we
+        # don't yet have any channels (hence no shortest)...
+        return shorten if shorten is not None else self.allowed
 
     def pong(self, chan, command, data, txn):
         """
@@ -2571,52 +2649,19 @@ class Server_HB(Server):
 
 class Server_HB_daemon(Server_daemon):
     """
-    Start a Server with Client channel Heartbeats.  After 2 heartbeat
-    cycles (7 seconds) are missed, the client channel is closed (15
-    seconds).
+    Start a Server with Client channel Heartbeat checks.  After 2
+    heartbeat cycles (7 seconds) are missed, the client channel is
+    closed (15 seconds).
 
     The cls must be derived from Server_HB, as we assume ping/pong
-    have been instrumented to collect timing information.  We trap the
-    allowed= keyword, and remember the timeout= value as the ping
-    interval, but pass it along; it also defines the maximum interval
-    at which Mincemeat_daeamon will call timeout.
+    have been instrumented to collect timing information.
     """
     def __init__(self, credentials, cls=Server_HB,
-                 timeout=7.0, allowed=15.0,
+                 interval=7.0, allowed=15.0, timeout=999.0,
                  **kwargs):
         Server_daemon.__init__(self, credentials, cls=cls,
-                               timeout=timeout, allowed=allowed,
+                               interval=interval, allowed=allowed, timeout=timeout,
                                **kwargs)
-        self.pingsent = 0. # the epoch
-        self.interval = timeout
-        self.allowed = allowed
-
-    def timeout(self):
-        """
-        The Server_daemon's process (asyncore.loop) Thread is invoking
-        us, not some external Thread; it also runs all the Server's
-        ServerChannel's channels.  Therefore, we can use send_command;
-        send_command_backchannel not necessary.
-
-        We have a number of channels open to Clients.  We want to
-        ensure that each Client remains responsive.  This means
-        sending a ping to each, ensuring a timely response.
-
-        Compute how long remains to send a ping, or 'til the maximum
-        time allowed for a pong.
-
-        """
-        now = time.time()
-        shorten = now - self.pingsent
-        if shorten > self.interval:
-            self.mincemeat.ping()
-            self.pingsent = now
-            shorten = self.interval
-        else:
-            logging.info("%s %.3f 'til next ping" % (self.name(), shorten))
-
-        return shorten
-
 
 class Client_HB(Client):
     """
@@ -2628,12 +2673,23 @@ class Client_HB(Client):
         self.pongtim = None             # time when pong received
         self.pongtxn = None             # it's transaction
 
-    def ping(self, allowed=None, **kwargs):
+    def starting(self, *args, **kwargs):
         """
-        Send a ping command to our Server, with a tell-tale time as
-        the transaction ID (this is the default ping behavior).  Allow
-        a certain amount of delay before killing our connection to the
-        (crippled) server.
+        Responds to the following keywords:
+        
+            "allowed"   -- must see responses to self.ping within allowed interval
+
+        """
+        self.allowed = kwargs.get('allowed', None)
+        if self.allowed is not None:
+            logging.info("%s allowing %.3f s between pongs" % (
+                        self.name(), self.allowed))
+        Client.starting(self, *args, **kwargs)
+
+    def health(self):
+        """
+        Allow only a certain amount of delay in ping responses before
+        killing our connection to the (crippled) server.
 
         This method must be invoked (at least) often enough to ensure
         that, under normal circumstances, the inter-ping latency, plus
@@ -2643,6 +2699,7 @@ class Client_HB(Client):
         # Check the last pong received.  Defaults to whenever we
         # began.  If we exceed allowed, treat as a protocol failure
         # (same as EOF).  Otherwise, send another ping.
+        shorten = None
         now = time.time()
         if self.pongtxn is not None:
             # We note that a pong has been received.  Compute the
@@ -2658,15 +2715,21 @@ class Client_HB(Client):
             since = now - self.pingbeg
             sincemsg = "%.3f s (no replies received)" % since
 
-        if allowed is not None and since > allowed:
-            logging.warning("%s ping latency %s, last %s; Exceeds %.3fs allowed; disconnecting!" % (
-                self.name(), delaymsg, sincemsg, allowed))
+        if self.allowed is not None and since > self.allowed:
+            logging.warning("%s ping latency %s, last %s; Exceeds %.3f s allowed; Unhealthy Server; disconnecting!" % (
+                self.name(), delaymsg, sincemsg, self.allowed))
             self.handle_close()
         else:
-            logging.info("%s ping latency %s, last %s <= %s" % (
-                self.name(), delaymsg, sincemsg, allowed))
-            kwargs.update({'now': now})
-            Client.ping(self, **kwargs)
+            logging.debug("%s ping latency %s, last %s <= %s" % (
+                self.name(), delaymsg, sincemsg, self.allowed))
+            shorten = self.allowed - since
+
+        if shorten is not None:
+            logging.debug("%s needs to see a pong from Server within %.3f s" % (
+                            self.name(), shorten ))
+
+        # May be None, if we just .handle_close()ed ourself...
+        return shorten
 
     def pong(self, command, data, txn):
         """
@@ -2680,39 +2743,16 @@ class Client_HB(Client):
 
 class Client_HB_daemon(Client_daemon):
     """
-    Start a Client with Server Heartbeats.  After 2 heartbeat
-    cycles (27 seconds) are missed, the client channel is closed (60
+    Start a Client with Server Heartbeats.  After 2 heartbeat intervals
+    (27 seconds) go without response, the client channel is closed (60
     seconds).
     """
     def __init__(self, credentials, cls=Client_HB,
-                 timeout=27.0, allowed=60.0,
+                 interval=27.0, allowed=60.0, timeout=999.0,
                  **kwargs):
         Client_daemon.__init__(self, credentials, cls=cls,
-                               timeout=timeout,
+                               interval=interval, allowed=allowed, timeout=timeout,
                                **kwargs)
-        self.pingsent = 0. # the epoch
-        self.interval = timeout
-        self.allowed = allowed
-
-    def timeout(self):
-        """
-        The Client_daemon's process (asyncore.loop) thread is invoking
-        us; use send_command; send_command_backchannel not necessary.
-
-        We just want to ensure our server is alive, and the
-        communications channel is open.  If we don't get a response
-        within a certain period, there will be... trouble.
-        """
-        now = time.time()
-        shorten = now - self.pingsent
-        if shorten > self.interval:
-            self.mincemeat.ping()
-            self.pingsent = now
-            shorten = self.interval
-        else:
-            logging.info("%s %.3f 'til next ping" % (self.name(), shorten))
-
-        return shorten
 
 
 def run_client():
