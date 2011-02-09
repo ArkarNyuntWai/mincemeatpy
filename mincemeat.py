@@ -416,20 +416,20 @@ class Mincemeat_daemon(threading.Thread):
             map = {}
         if schedule is None:
             schedule = collections.deque()
-        self.mincemeat = cls(map=map, schedule=schedule, shuttout=shuttout)
-        if not hasattr(self.mincemeat, '_map'):
+        self.endpoint = cls(map=map, schedule=schedule, shuttout=shuttout)
+        if not hasattr(self.endpoint, '_map'):
             raise AttributeError("%s requires a cls=... object be derived from asyncore.dispatcher"
                                   % (self.__class__))
         logging.debug("%s using asyncore socket map: %s" % (
-            self.mincemeat.name(), repr.repr(self.mincemeat._map)))
-        self.mincemeat.conn(asynchronous=True, **credentials)
+            self.endpoint.name(), repr.repr(self.endpoint._map)))
+        self.endpoint.conn(asynchronous=True, **credentials)
 
     def name(self):
-        return self.mincemeat.name()
+        return self.endpoint.name()
 
     def state(self):
         if self._state == "processing":
-            if self.mincemeat.authenticated():
+            if self.endpoint.authenticated():
                 self._state = "authenticated"
         return self._state
 
@@ -455,9 +455,9 @@ class Mincemeat_daemon(threading.Thread):
 
         Implements the default processing loop.  If no timeout= was
         specified to __init__, it will simply process with no timeout,
-        'til underlying mincemeat object is finished (its
-        asyncore.dispatcher._map is empty).  The timeout() methods will
-        never be fired, until the very end (with done=True).
+        'til underlying endpoint Client/Server object is finished (its
+        asyncore.dispatcher._map is empty).  The timeout() methods
+        will never be fired, until the very end (with done=True).
 
         If timeout() is overriden in derived class, pass a timeout=#
         keyword arg to class constructor to implement a timed
@@ -470,7 +470,7 @@ class Mincemeat_daemon(threading.Thread):
         self._state = "processing"
 
         try:
-            self.mincemeat.starting(**kwargs)
+            self.endpoint.starting(**kwargs)
 
             # Pull 'timeout' out of the keyword args (None if
             # unspecified) If non-None, we'll kick things off with an
@@ -480,20 +480,20 @@ class Mincemeat_daemon(threading.Thread):
             # routines to "shorten" it.
             timeout = kwargs.get('timeout', None)
             shorten = timeout if timeout is None else 0.0
-            while self.mincemeat.process(timeout=shorten):
+            while self.endpoint.process(timeout=shorten):
                 shorten = timeout
                 requested = self.timeout()
                 if shorten is None or (requested is not None and requested < shorten):
                     shorten = requested
                 
-            self.mincemeat.stopping()
+            self.endpoint.stopping()
         except Exception, e:
             logging.info("%s failed: %s" % (self.name(), e))
             self._state = "failed: %s" % e
         else:
             # Normal thread exit; if finished() and authenticated(),
             # assume success
-            if self.mincemeat.finished() and self.mincemeat.authenticated():
+            if self.endpoint.finished() and self.endpoint.authenticated():
                 self._state = "success"
             else:
                 self._state = "failed: incomplete"
@@ -518,7 +518,7 @@ class Mincemeat_daemon(threading.Thread):
         """
         shorten = None
 
-        requested = self.mincemeat.timeout()
+        requested = self.endpoint.timeout()
         if shorten is None or (requested is not None and requested < shorten):
             shorten = requested
 
@@ -537,11 +537,11 @@ class Mincemeat_daemon(threading.Thread):
         client is frozen and won't respond to an EOF.
         """
         # It is safe (no-op) to invoke this multiple times
-        self.mincemeat.handle_close()
+        self.endpoint.handle_close()
         self.join(timeout)
         # Still not dead?  Some client must be frozen.  Try harder.
         if self.is_alive():
-            close_all(map=self.mincemeat._map, ignore_all=True)
+            close_all(map=self.endpoint._map, ignore_all=True)
             self.join(0.)
 
 # ##########################################################################

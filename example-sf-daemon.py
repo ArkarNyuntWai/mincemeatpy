@@ -256,7 +256,7 @@ class Cli(mincemeat.Client_daemon):
         """
         logging.info("%s timeout %s" % (
                 self.name(), done and "done" or ""))
-        self.mincemeat.send_command("ping", ( "Client Timeout from %s" % (
+        self.endpoint.send_command("ping", ( "Client Timeout from %s" % (
                                              socket.getfqdn()), 
                                         "%s -- Client loop" % ( 
                                              threading.current_thread().name )))
@@ -271,7 +271,7 @@ class Svr(mincemeat.Server_daemon):
         """
         logging.info("%s timeout %s" % (
                 self.name(), done and "done" or ""))
-        for chan in self.mincemeat.taskmanager.channels.keys():
+        for chan in self.endpoint.taskmanager.channels.keys():
             chan.send_command("ping", ( "Server Timeout from %s" % (
                                              socket.getfqdn()), 
                                         "%s -- Server loop" % ( 
@@ -360,7 +360,7 @@ def main():
                 if svr:
                     svrsta = logchange( svr, svrsta )
                 begun = time.clock()
-                cli.mincemeat.send_command_backchannel(
+                cli.endpoint.send_command_backchannel(
                     "ping", ( "Request from %s" % ( socket.getfqdn()),
                                #'x' * 1 * 1000 * 1000 ))        # a big blob...
                               "%s -- main thread" % (           # a thread name
@@ -371,8 +371,8 @@ def main():
             # we were running Server.  We'll access the
             # mincemeat.Server.output deque directly, and pass the
             # (txn,results) tuple as position args.
-            while svr.mincemeat.output:
-                args = svr.mincemeat.output.popleft()
+            while svr.endpoint.output:
+                args = svr.endpoint.output.popleft()
                 server_results(top=100, *args)
 
 
