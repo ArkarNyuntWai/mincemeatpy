@@ -974,7 +974,7 @@ class Protocol(threaded_async_chat):
         The asyncore.dispatcher.log_info type='name' categorization
         maps directly onto the logging.name; redirect.
         """
-        getattr(logging,type)("%s %s" % (self.name(), message))
+        getattr(logging, type)("%s %s" % (self.name(), message))
 
     def collect_incoming_data(self, data):
         self.buffer.append(data)
@@ -1716,8 +1716,8 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     # ----------------------------------------------------------------------
     # overridden asyncore.dispatcher methods
     # 
-    def log_info(self, message, type):
-        getattr(logging,type)(message)
+    def log_info(self, message, type='info'):
+        getattr(logging, type)("%s %s" % (self.name(), message))
 
     def handle_accept(self):
         """
