@@ -54,7 +54,7 @@ DEFAULT_PORT = 11235
 # Choose the best high-resolution timer for the platform
 timer = timeit.default_timer
 
-# Pre-2.6 threading.Thread didn't have is_alive, etc...  Set up some
+# Pre-2.6 threading.* didn't have is_alive, etc...  Set up some
 # aliases, so it looks more modern.
 if not hasattr(threading, 'current_thread'):
     threading.current_thread = threading.currentThread
@@ -63,6 +63,8 @@ if not hasattr(threading.Thread, 'is_alive'):
 if not hasattr(threading.Thread, 'name'):
     threading.Thread.name = property(threading.Thread.getName,
                                      threading.Thread.setName)
+if not hasattr(threading._Event, 'is_set'):
+    threading._Event.is_set = threading._Event.isSet
 
 def generator(func):
     """
@@ -649,15 +651,15 @@ class threaded_async_chat(asynchat.async_chat):
             # during attempting to send will flow back to the caller.
             # 
             # This is a non-locked check; could there be a race
-            # condition here, where we could see self.sending as
-            # True (from some previous check), but the aysncore.loop
-            # is about to invoke writable(), and discover a False?
-            # Our caller must have just pushed some data, either
-            # before OR after the asyncore.loop's called writable
-            # (because they all are serialized on the same lock).  So,
-            # if self.sending is False, the check was from before
-            # the push; if after (and it's False), then the FIFO was
-            # actually empty (data already sent).  So, no race.
+            # condition here?  Could we see self.sending as True (from
+            # some previous check), but the aysncore.loop is about to
+            # invoke writable(), and discover a False?  Our caller
+            # must have just pushed some data, either before OR after
+            # the asyncore.loop's called writable (because they are
+            # all serialized on the same lock).  So, if self.sending
+            # is False, the check was from before the push; if after
+            # (and it's False), then the FIFO was actually empty (data
+            # already sent).  So, no race.
             with self.send_lock:
                 if asynchat.async_chat.writable(self):
                     # asyncore.loop doesn't (yet) know we need to
@@ -797,6 +799,7 @@ class Protocol(threaded_async_chat):
         self.set_terminator("\n")
         self.buffer = []
         self.auth = None
+        self.auth_event = threading.Event()
         self.mid_command = False
         self.what = "Proto."
         self.peer = True                # Name shows >peer i'face by default
@@ -889,7 +892,22 @@ class Protocol(threaded_async_chat):
                 self.name(),
                 str(self.locl), str(self.addr)))
 
-    def authenticated(self):
+    def authenticated(self, timeout=0.):
+        """
+        Return whether the Protocol endpoint is authenticated.  If
+        non-zero timeout specified, block 'til auth'ed (or expiry.)
+        Avoid the threading.Event overhead by only invoking Event.wait
+        if necessary; this is a one-way flag, so this is safe.
+
+        WARNING
+        
+        Providing a non-zero timeout probably doesn't mean what you
+        think it means...  Before Python 3.2, these timeouts are
+        actually implemented as a fairly tight polling loop in
+        threading.Condition.wait; use sparingly.
+        """
+        if self.auth != "Done":
+            self.auth_event.wait(timeout)
         return self.auth == "Done"
 
     def send_command(self, command, data=None, txn=None):
@@ -1110,6 +1128,7 @@ class Protocol(threaded_async_chat):
         if data == mac.digest().encode("hex"):
             self.auth = "Done"
             logging.info("%s Authenticated other end" % self.name())
+            self.auth_event.set()
         else:
             self.handle_close()
 
@@ -1604,12 +1623,13 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         txn, results = self.output.popleft()
         return results
 
-    def authenticated(self):
+    def authenticated(self, timeout=0.):
         """
-        Server has no authenticated phase; only its ServerChannel.
-        Therefore, we always deem ourselves to be Authenticated.  This
-        is one of the factors used by the Mincemeat_daemon in
-        determining a successful completion state.
+        Server has no authenticated phase; only its ServerChannel(s)
+        do, and they don't report for duty 'til they are done
+        authenticating.  Therefore, we always deem a Server to be
+        authenticated.  This is one of the factors used by the
+        Mincemeat_daemon in determining a successful completion state.
         """
         return True
 
