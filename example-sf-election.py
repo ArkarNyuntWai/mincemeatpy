@@ -246,7 +246,7 @@ def client( credentials ):
     c.conn( **credentials )
     # Client communications with Server done; either server completed
     # success, or exited without completing our authentication.
-    if c.auth != "Done":
+    if not c.authenticated():
         raise Exception( "No server authenticated!" )
     
 if __name__ == '__main__':

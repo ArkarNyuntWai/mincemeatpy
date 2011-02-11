@@ -256,7 +256,7 @@ def main_server_on_demand():
                 cli = client(credentials  = addr_info,
                              asynchronous = False,
                              map          = {})
-                if cli.auth != 'Done':
+                if not cli.authenticated():
                     cli = None
                     raise socket.error(errno.ENOTCONN, "Authentication failure")
                 break

@@ -632,7 +632,7 @@ def REPL( cli ):
             else:
                 # A Blank line.  Get some stats.
                 cmd = "stats"
-            cli.mincemeat.send_command_backchannel(
+            cli.endpoint.send_command_backchannel(
                 cmd, inp, txn=str(txn))
         else:
             # EOF
