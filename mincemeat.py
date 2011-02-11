@@ -176,8 +176,8 @@ def process(timeout=None, map=None, schedule=None):
                     try:
                         if now >= exp:
                             logging.debug("Firing scheduled event %s (repeat: %s)" % (
-                                    '.'.join( [] if not hasattr(fun, "im_class") 
-                                              else [fun.im_class.__name__]
+                                    '.'.join( ([] if not hasattr(fun, "im_class") 
+                                               else [fun.im_class.__name__])
                                               + [fun.__name__]), rpt))
                             fun()               # Timer expired; fire fun()!
                         else:
@@ -222,8 +222,10 @@ def process(timeout=None, map=None, schedule=None):
                 remains = min(remains)
             else:
                 remains = None
-            logging.debug("asyncore.loop %d sock., dur: %3.6f, remains: %3.7f of timeout: %s" % (
-                    len(map), dur,
+            logging.debug("asyncore.loop socks: %s, sched: %s, dur: %.6f, remains: %.6f of timeout: %s" % (
+                    len(map),
+                    len(schedule) if schedule is not None else None,
+                    dur,
                     remains if remains is not None else float("inf"), timeout))
 
             asyncore.loop(timeout=remains, map=map, count=1)
@@ -421,8 +423,6 @@ class Mincemeat_daemon(threading.Thread):
         if not hasattr(self.endpoint, '_map'):
             raise AttributeError("%s requires a cls=... object be derived from asyncore.dispatcher"
                                   % (self.__class__))
-        logging.debug("%s using asyncore socket map: %s" % (
-            self.endpoint.name(), repr.repr(self.endpoint._map)))
         self.endpoint.conn(asynchronous=True, **credentials)
 
     def name(self):
@@ -2524,7 +2524,8 @@ class TaskManager(object):
                             key = random.choice(self.work.keys())
                             logging.debug("%s Mapping %s rework" % (
                                     self.server.name(), channel.name()))
-                            return ('map', (key, self.work[key]), self.txn)
+                            return (self.statecommand[self.state],
+                                    (key, self.work[key]), self.txn)
                         # Busy, but no more rework required.  Idle it.
                         logging.debug("%s Mapping %s idling (CONTINUOUS)" % (
                                 self.server.name(), channel.name()))
