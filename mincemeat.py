@@ -201,7 +201,7 @@ def process(timeout=None, map=None, schedule=None):
                         # repeat still in the future.
                         mis = int((now - exp) / rpt)
                         if mis:
-                            logging.warning("Missed %d firings of schedule event %s" % (
+                            logging.info("Missed %d firings of schedule event %s" % (
                                     mis, fun))
                         exp += (mis + 1) * rpt
                         remains.append(exp - now)
@@ -492,8 +492,6 @@ class Mincemeat_daemon(threading.Thread):
             logging.info("%s failed: %s" % (self.name(), e))
             self._state = "failed: %s" % e
         else:
-            # Normal thread exit; if finished() and authenticated(),
-            # assume success
             if self.endpoint.finished() and self.endpoint.authenticated():
                 self._state = "success"
             else:
@@ -719,9 +717,9 @@ class threaded_async_chat(asynchat.async_chat):
         been given provision to do this, we need to just close the
         socket now.
         """
-        if self.shutdown is False:
-            self.shutdown = True
-            if self.reading is False:
+        if self.reading is False:
+            if self.shutdown is False:
+                self.shutdown = True
                 try:
                      if 0 == self.socket.getsockopt(socket.SOL_SOCKET,
                                                     socket.SO_ERROR):
@@ -737,9 +735,9 @@ class threaded_async_chat(asynchat.async_chat):
                     logging.warning("%s shut down failed: %s" % (
                             self.name(), e ))
             else:
-                logging.debug("%s shut down at EOF!" % self.name())
+                logging.debug("%s shut down already!" % self.name())
         else:
-            logging.debug("%s shut down already!" % self.name())
+            logging.debug("%s shut down at EOF!" % self.name())
 
         return False
 
@@ -1690,16 +1688,18 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     # 
     def finished(self):
         """
-        Detect if finished (either completely, or a Transaction), by
-        checking if the TaskManager is completely done, or something
-        is available on the output deque.
+        Detect if finished, by checking if the TaskManager is between
+        transactions.
         
         If you've overridden resultfn to handle results differently,
         this may not work as you expect; it'll never report "finished"
         'til after the TaskManager is done the final Map/Reduce
         transaction!
         """
-        return self.taskmanager.state == TaskManager.FINISHED
+        return self.taskmanager.state in [
+            TaskManager.IDLE,
+            TaskManager.FINISHED,
+            ]
 
     def results(self):
         """
