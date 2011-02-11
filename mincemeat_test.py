@@ -34,7 +34,7 @@ credentials = {
     'finishfn':         None,
 }
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.ERROR)
 
 def slow(fun, amt):
     def wrapper(*args, **kwargs):
@@ -191,4 +191,7 @@ def test_schedule():
         now = mincemeat.timer()
     
     assert state[:-1] == (True, True, True)
+
+    c1.stop()
+    s1.stop()
 

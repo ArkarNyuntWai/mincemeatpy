@@ -891,7 +891,8 @@ class Protocol(threaded_async_chat):
         Providing a non-zero timeout to threading.Condition.wait probably
         doesn't mean what you think it means...  Before Python 3.2, these
         timeouts are actually implemented as a fairly tight polling loop in
-        threading.Condition.wait; use sparingly.
+        threading.Condition.wait; use sparingly.  However, http://goo.gl/Oj7GF
+        sparked an idea:
 
         Since we already have another thread handy (the process/ asyncore.loop
         thread), and we can schedule it to perform synchronous scheduled events,
