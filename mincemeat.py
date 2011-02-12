@@ -65,6 +65,8 @@ if not hasattr(threading.Thread, 'name'):
                                      threading.Thread.setName)
 if not hasattr(threading._Event, 'is_set'):
     threading._Event.is_set = threading._Event.isSet
+if not hasattr(threading._Condition, 'notify_all'):
+    threading._Condition.notify_all = threading._Condition.notifyAll
 
 def generator(func):
     """
