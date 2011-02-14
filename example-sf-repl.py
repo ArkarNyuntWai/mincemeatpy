@@ -442,7 +442,7 @@ def logchange( who, previous ):
 # Deriving from mincemeat.Mincemeat_daemon
 # 
 #     Pass a 'timeout=#.#' to the constructor, and override the
-# timeout method; timeout wil be invoked by the daemon's service
+# timeout method; timeout will be invoked by the daemon's service
 # thread at the specified interval.  To send commands within timeout; use
 # send_command, NOT send_command_backchannel as required for external
 # thread initiated commands!
@@ -771,5 +771,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.WARNING )
+    logging.basicConfig( level=logging.INFO )
     sys.exit(main())

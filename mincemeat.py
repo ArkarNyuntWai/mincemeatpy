@@ -594,6 +594,7 @@ class threaded_async_chat(asynchat.async_chat):
         self.sending = False            # Is asyncore.loop sending data?
         self.reading = False            # Is asyncore.loop reading data?
         self.shutdown = False           # Have we already shut down?
+        self.closed = False
 
     def handle_read(self):
         """
@@ -698,46 +699,54 @@ class threaded_async_chat(asynchat.async_chat):
                 if e.arg[0] != errno.EINTR:
                     break
 
+    def close(self):
+        """
+        Keep track of when we finally actually closed the socket.
+        """
+        self.closed = True
+        asynchat.async_chat.close(self)
+
     def tidy_close(self):
         """
-        Indicate completion to the peer, by closing outgoing half of
-        socket, returning True iff we cleanly shutdown the outgoing
-        half of the socket.  We only do this once, and only if we
-        aren't reading (indicating an EOF), or in an error condition!
+        Indicate completion to the peer, by closing outgoing half of socket,
+        returning True iff we cleanly shutdown the outgoing half of the socket.
+        We only do this once, and only if we aren't reading (indicating an EOF),
+        closed, or in an error condition (or have a bad socket or fd!)
         
-        This will result in an EOF flowing through to the
-        client, after the current operation is complete, eventually
-        leading to a handle_close there, and finally an EOF and a
-        handle_close here; the kernel TCP/IP layer will cleanly
-        release the resources.  See http://goo.gl/EtAyN for a
+        This will result in an EOF flowing through to the client, after the
+        current operation is complete, eventually leading to a handle_close
+        there, and finally an EOF and a handle_close here; the kernel TCP/IP
+        layer will cleanly release the resources.  See http://goo.gl/EtAyN for a
         confirmation of these semantics for Windows.
 
-        This may, of course, not actually flow through to the client
-        (no route, client hung, ...)  Therefore, the caller needs to
-        ensure that we wake up after some time, and forcibly close our
-        end of the connection if this doesn't work!  If we haven't
-        been given provision to do this, we need to just close the
-        socket now.
+        This may, of course, not actually flow through to the client (no route,
+        client hung, ...)  Therefore, the caller needs to ensure that we wake up
+        after some time, and forcibly close our end of the connection if this
+        doesn't work!  If we haven't been given provision to do this, we need to
+        just close the socket now.
         """
         if self.reading is False:
-            if self.shutdown is False:
-                self.shutdown = True
-                try:
-                     if 0 == self.socket.getsockopt(socket.SOL_SOCKET,
-                                                    socket.SO_ERROR):
-                         # No reading (EOF), and socket not in error.
-                         # There's a good chance that we might be able
-                         # to cleanly shutdown the outgoing half, and
-                         # flow an EOF through
-                         logging.debug("%s shut down to peer %s" % (
-                                 self.name(), str(self.addr)))
-                         self.socket.shutdown(socket.SHUT_WR)
-                         return True
-                except Exception, e:
-                    logging.warning("%s shut down failed: %s" % (
-                            self.name(), e ))
+            if self.closed is False:
+                if self.shutdown is False:
+                    self.shutdown = True
+                    try:
+                         if 0 == self.socket.getsockopt(socket.SOL_SOCKET,
+                                                        socket.SO_ERROR):
+                             # No reading (EOF), and socket not in error.
+                             # There's a good chance that we might be able to
+                             # cleanly shutdown the outgoing half, and flow an
+                             # EOF through
+                             logging.info("%s shutdown to peer  %s" % (
+                                     self.name(), str(self.addr)))
+                             self.socket.shutdown(socket.SHUT_WR)
+                             return True
+                    except Exception, e:
+                        logging.info("%s shut down failed: %s" % (
+                                self.name(), e ))
+                else:
+                    logging.debug("%s shut down already!" % self.name())
             else:
-                logging.debug("%s shut down already!" % self.name())
+                logging.debug("%s closed already!" % self.name())
         else:
             logging.debug("%s shut down at EOF!" % self.name())
 
@@ -807,8 +816,6 @@ class Protocol(threaded_async_chat):
         self.what = "Proto."
         self.peer = True                # Name shows >peer i'face by default
         self.locl = None                # Just like self.addr, 'til known
-
-        self.closed = False
 
     def auth_wake(self):
         with self.auth_cond:
@@ -1146,7 +1153,6 @@ class Protocol(threaded_async_chat):
         Keep track of when we finally closed the socket.  Wake up any thread
         awaiting on authenticated; they'll need to do something else...
         """
-        self.closed = True
         self.auth_wake()
         threaded_async_chat.close(self)
 
@@ -1179,7 +1185,7 @@ class Protocol(threaded_async_chat):
             # Already did a shutdown, no connection timeouts, or no schedule to
             # handle them, or an exception while attempting to shut down socket
             # and schedule a future cleanup.  Just close.
-            logging.info("%s closing connection to peer %s" % (
+            logging.info("%s closed connection %s" % (
                     self.name(), str(self.addr)))
             self.close()
 
@@ -2085,21 +2091,16 @@ class ServerChannel(Protocol):
     # needs to be prodded, as a Map/Reduce Transaction proceeds, or channels
     # appear/disappear.
     # 
-    # When the TaskManager decides that it is done, ServerChannels reporting
-    # for duty will be issued a Protocol 'disconnect' command, which will
-    # cause them to perform a handle_close.
+    # When the TaskManager decides that it is done, ServerChannels reporting for
+    # duty will be issued a Protocol 'disconnect' command, which will cause them
+    # to perform a handle_close.
+    # 
+    # We don't want to try to deduce whether or not this channel should be
+    # closing, here -- we leave it up to the higher-level TaskManager, Server,
+    # etc., to decide these things.  Otherwise, we'll get into trouble with
+    # multiple parties trying to maintaining TaskManager's state (eg. via
+    # jump_start.)
     def start_new_task(self):
-        if not self.server.accepting:
-            # The Server is no longer accepting connections; it must be in the
-            # process of shutting down!  If we haven't already been shutdown,
-            # try to take this channel down nicely, allowing the EOF to flow
-            # thru to the client.  Continue on getting a next_task, though, to
-            # drive the TaskManager state machinery along, in case we are just
-            # finishing up the last bits of a Map/Reduce Transaction; we might
-            # be able to deliver results before the bitter end!!  Depend on a
-            # scheduled handle_close to shut us down harshly, if necessary.
-            if not self.shutdown:
-                self.handle_close()
         command, data, txn = self.server.taskmanager.next_task(self)
         if command == None:
             self.server.taskmanager.channel_idle(self)
@@ -2290,12 +2291,21 @@ class TaskManager(object):
     # to ever wake it up...  
     # 
     def channel_opened(self, chan):
-        self.channel_idle(chan)
+        self.channel_log(chan, "Opened")
+        self.channels[chan] = None
 
     def channel_closed(self, chan):
-        self.channel_log(chan, "Disconnect")
-        self.channels.pop(chan, None)
-        self.jump_start(count=1)
+        """
+        A channel has been closed; perhaps not for the first time (due
+        to tidy shutdown).  If this is the first report, remove it
+        from the active channels, and jump-start the TaskManager state
+        machinery, so that things don't go completely idle, if this
+        was the last channel w/activity being waited for...
+        """
+        if chan in self.channels:
+            self.channel_log(chan, "Closed")
+            self.channels.pop(chan, None)
+            self.jump_start(count=1)
 
     def channel_idle(self, chan):
         self.channel_log(chan, "Idle")
@@ -2308,19 +2318,31 @@ class TaskManager(object):
         self.channel_log(chan, "Sending", detail=repr.repr(data))
 
     def channel_process(self, chan, response, data, txn):
+        """
+        Update what we think a channel is processing.  Even though responses may
+        be arbitrarily delayed, we should not have "moved on" to another txn
+        until we got a response from the last one...  However, we can't
+        guarantee that some implementation hasn't implemented some custom
+        timeout code that throws a channel back into the pool...  
+
+        So, if the channel entry doesn't exist, we'll still log, but be careful
+        to NOT update the channels entry; we don't want to be resurrecting
+        channels that have already been closed.
+
+        If we find a mismatched txn, we'll update the channels entry and log it;
+        the payload will be rejected in TaskManager.*_done due to the
+        mismatching txn.
+        """
         what = "Processing"
         try:
             cmdtxn, command, __, started = self.channels[chan]
+            if txn != cmdtxn:
+                what = "Mismatched"
+            self.channels[chan] = (txn, command, response, started)
         except:
-            cmdtxn = None
-            command = None
-            started = time.time()
             what = "Spontaneous"
             
-        if txn != cmdtxn:
-            return
-        self.channels[chan] = (cmdtxn, command, response, started)
-        self.channel_log(chan, "Processing", detail=repr.repr(data))
+        self.channel_log(chan, what, detail=repr.repr(data))
 
     def channel_log(self, chan, what, detail=None, how="info"):
         if chan is None:
@@ -2578,6 +2600,8 @@ class TaskManager(object):
             # or redefined) .resultfn with results.  Stop accepting
             # new Client connections, and send ga 'disconnect' to each
             # client that asks for a new task.
+            logging.info("%s Results: %s" % (
+                    self.server.name(), repr.repr(self.results)))
             self.server.resultfn(self.txn, self.results)
 
             if self.cycle == self.PERMANENT:
@@ -2589,12 +2613,12 @@ class TaskManager(object):
                 self.server.handle_close()
                 return ('disconnect', None, self.txn)
 
-        # When making some state transitions, we'll need to loop, to
-        # determine the work unit to assign to this channel.
+        # When making some state transitions (those involving cycling back to a
+        # lower-numbered state), we'll need to loop to determine the work unit
+        # to assign to this channel.
         logging.debug("%s %s %s looping..." % (
                 self.server.name(), self.statename[self.state], channel.name()))
         return self.next_task(channel)
-    
 
     def map_done(self, data, txn):
         """
