@@ -54,7 +54,11 @@ DEFAULT_PORT = 11235
 # Choose the best high-resolution timer for the platform
 timer = timeit.default_timer
 
-# Pre-2.6 threading.* didn't have is_alive, etc...  Set up some
+# ##########################################################################
+# 
+# threading.*           -- Modernise pre-2.6 threading interface
+# 
+#     Pre-2.6 threading.* didn't have is_alive, etc...  Set up some
 # aliases, so it looks more modern.
 if not hasattr(threading, 'current_thread'):
     threading.current_thread = threading.currentThread
@@ -67,6 +71,7 @@ if not hasattr(threading._Event, 'is_set'):
     threading._Event.is_set = threading._Event.isSet
 if not hasattr(threading._Condition, 'notify_all'):
     threading._Condition.notify_all = threading._Condition.notifyAll
+
 
 def generator(func):
     """
@@ -100,231 +105,10 @@ def applyover(func, itr):
         return generator(func)(itr)
 
 
-def function_name(func):
-    """
-    Return a more human readable name for an (optionally bound) function.
-    """
-    return '.'.join( ([] if not hasattr(func, "im_class") 
-                      else [func.im_class.__name__])
-                     + [func.__name__])
-
-def minimum_time(least, *rest):
-    """
-    Computes the minimum of an arbitrary number of wall-clock times (in seconds
-    since the Epoch) or durations (in seconds), where None implies no time or
-    duration.  In other words, any time (including 0.) is greater than None.
-    """
-    for t in rest:
-        if least is None or (t is not None and t < least):
-            least = t
-
-    return least
-
-def next_future_time(expiry, repeat, now=None):
-    """
-    Computes the next (future) expiry of a repeating event, relative to 'now'.
-    Returns that expiry time, the number of repeats missed, and the amount
-    we've already passed into the current repeat interval (-'ve if not yet
-    expired!).
-
-    Returns the number of repeat intervals already passed since expiry, and the
-    portion of the next interval already passed (usually ignored -- it embodies
-    the error of the system timer()).
-    
-    Since we don't save the very original scheduled expiry, we ensure it
-    will creep over time by an amount proportional to the limit of the
-    precision of a Python float (ie. not much) -- so we always base exp
-    from itself, NOT now (which may have a much lower precision, on the
-    order of 1ms!)
-    """
-    if now is None:
-        now = timer()
-    if now >= expiry:
-        missed, passed = divmod(now - expiry, repeat)
-        expiry += missed * repeat + repeat
-    else:
-        missed = 0.
-        passed = now - expiry
-
-    return expiry, missed, passed
-
 # ##########################################################################
 # 
-# trigger               -- dispatches and re-schedules expired scheduled events
-# process               -- asyncore event loop, with synchronous scheduling
-# 
-#     Implements the traditional asyncore.loop processing loop supporting
-# arbitrary numbers of asyncore.dispatcher and/or asynchat.async_chat based
-# objects sharing a single socket map.
-# 
-#     Also implements auto-firing scheduled events (one-shot or repeating),
-# while respecting the (optional) caller-defined timeout.
-# 
-def trigger(schedule, now=None):
-    """
-    Dispatch (and re-schedule) expired scheduled events.  Returns the next
-    scheduled event's expiry (or None).  Modifies the passed schedule.
-    """
-    if not schedule:
-        return None
-    if now is None:
-        now = timer()
-    nxt = None
-    for exp, fun, rpt in sorted(schedule):
-        try:
-            if now >= exp:
-                # Scheduled event expired; Fire fun()!  Arbitrary time passes...
-                logging.debug("Firing scheduled event %s (repeat: %s)" % (
-                        function_name(fun), rpt))
-                fun()
-                now = timer()
-            else:
-                # Scheduled event is in future; done.
-                nxt = minimum_time(nxt, exp)
-                break
-        except Exception, e:
-            # A scheduled event failed; this isn't
-            # considered fatal, but may be of interest...
-            logging.warning("Failed scheduled event %s: %s\n%s" % (
-                    fun, e, traceback.format_exc()))
-    
-        # This event was at or before now (and was fired); remove it and loop to
-        # get next one (if any).
-        schedule.remove((exp, fun, rpt))
-        if rpt:
-            # Repeat is not None/zero.  Careful re-schedule the event.  If we've
-            # already missed one (or more) timeouts, log this fact, and
-            # re-schedule for the next future multiple of repeat interval.
-            exp, mis, pas = next_future_time(exp, rpt, now=now)
-            nxt = minimum_time(nxt, exp)
-            if int(mis):
-                logging.info("Missed %d firings (and %.3f s of next) of scheduled event %s" % (
-                        int(mis), pas, function_name(fun)))
-            schedule.append((exp, fun, rpt))
-
-    return nxt
-
-def process(timeout=None, map=None, schedule=None):
-    """
-    Processes asyncore based Server or Client events 'til none left
-    (or timeout expires), dispatching scheduled events as we go.  On
-    Exception, forcibly cleans up all sockets using the same asyncore
-    map.  Return True while more events may be possible, and the
-    caller should re-invoke.
-
-    If multiple sets of asyncore based objects use separate maps, then
-    each separate map needs to be run using a process (or
-    asyncore.loop) in a separate thread.  For example, a single Python
-    instance may run both a Server, and one or more Clients, or
-    multiple independent Server instances listening on different
-    ports.
-
-    Process asyncore events until the specific timeout (if not None)
-    expires, then return.  There is no guarantee, however, that we
-    will not return slightly after the timeout expires; the overage
-    may be as long as the duration of the longest event handler.
-
-    Unfortunately, we need to have knowledge of how asyncore.loop's
-    exit condition works; it looks at 'map' (or the global
-    asyncore.socket_map), and loops 'til it is empty.  We'll return
-    True while there may be more events to process.
-
-    Since we have elected to try to do "tidy" shutdowns of sockets on
-    controlled exit events (eg. when the Server or Client is directed
-    to terminate due to external events), we need to be able to
-    schedule future events.  In addition, there is a general need in
-    asynchronous event-driven applications to also support timed
-    events.  For example, a timeout on operations that should respond
-    within a certain window.
-
-    Therefore, we don't actually allow unbounded timeouts, and we
-    always specify count=1, to ensure that we return here after
-    processing every I/O event.  Thus, if (during the processing of
-    each event) another scheduled event was added, it will influence
-    the timeout of the next invocation.  It is recommended that a
-    thread-safe container like collections.deque is used, if multiple
-    threads may schedule events.
-    
-    All schedule events are of the form (expiry,callable,repeat),
-    where expiry is a timer() value, and callable is any callable
-    (normally, a bound method of an asyncore.dispatcher based object),
-    and repeat is a number of seconds (or None)
-    """
-    try:
-        if map is None:
-            map = asyncore.socket_map   # Internal asyncore knowledge!
-
-        beg = now = timer()
-        end = None              # Force one loop; computes end below, if timeout
-        while map and (end is None or now < end):
-            # Events on 'map' still possible, and either 'timeout' is infinite,
-            # or we haven't yet reached it.  Trigger scheduled events, and get
-            # earliest expiry remaining in schedule (arbitrary time passes...)
-            nxt = trigger(schedule, now=now)
-            now = timer()
-
-            # Done firing (and rescheduling) any expired events.  The earliest
-            # of the remaining scheduled events (and newly rescheduled events)
-            # is in nxt.  Now, further limit 'nxt' by 'timeout'.  Compute 'end'
-            # for real, to terminate process loop.  Finally, compute remains:
-            # None --> no timeout or other event expiry, 0 --> next scheduled
-            # expiry/timeout already passed, or +'ve --> future expiry.
-            if timeout is not None:
-                end = beg + timeout
-                nxt = minimum_time(nxt, end)
-
-            remains = None
-            if nxt is not None:
-                remains = max(0., nxt - now)
-
-            logging.debug(
-                "mincemeat.process socks: %s, sch: %s, dur: %.6f, rem: %.6f of t/o: %.6f" % (
-                    len(map),
-                    len(schedule) if schedule is not None else None,
-                    now - beg,
-                    remains if remains is not None else float("inf"),
-                    timeout if timeout is not None else float("inf")))
-
-            asyncore.loop(timeout=remains, map=map, count=1)
-            now = timer()
-
-    except Exception, e:
-        # We're no longer running asyncore.loop, so can't do anything cleanly;
-        # just close 'em all...  This should ensure that any socket resources
-        # associated with this object get cleaned up.  In order to ensure that
-        # the original error context gets raised, even if the asyncore.close_all
-        # fails, we must use re-raise inside a try-finally.
-        try:
-            raise
-        finally:
-            close_all(map=map, ignore_all=True)
-
-    # True iff map isn't empty: there may be more asynchronous I/O events
-    return bool(map)
-
-def close_all(map=None, ignore_all=False):
-    """
-    Safely close all sockets, forcing loop (using the same map) to
-    exit.  Handles pre-2.6 asyncore.close_all args.
-    """
-    try:
-        if map is None:
-            map = asyncore.socket_map
-        logging.warning("Forcibly closing remaining %d sockets: %s" % (
-                len(map), repr.repr(map)))
-        asyncore.close_all(map=map, ignore_all=True)
-    except TypeError:
-        # Support pre-2.6 asyncore; no ignore_all...
-        try: 
-            asyncore.close_all(map=map)
-        except Exception, e:
-            logging.warning("Pre-2.6 asyncore; socket map cleanup incomplete: %s" % (e))
-    
-
-# ##########################################################################
-# 
-# Mincemeat_class       -- Interface required by _daemon
-# Mincemeat_daemon      -- Standard daemon Thread fo Client or Server
+# Mincemeat_class       -- Interface required by mincemeat.*_daemon
+# Mincemeat_daemon      -- Standard daemon Thread for mincemeat Client/Server
 # 
 class Mincemeat_class(object):
     """
@@ -594,11 +378,239 @@ class Mincemeat_daemon(threading.Thread):
             close_all(map=self.endpoint._map, ignore_all=True)
             self.join(0.)
 
+
 # ##########################################################################
 # 
-# threaded_async_chat   -- threadsafe asynchat interface, pre-2.6 compatible
+# asynchat:
+#   async_chat  -- thread-safe implementation of async_chat, w/2.6 interface
+# asyncore:
+#   close_all   -- close all sockets in asyncore socket map, w/2.6 interface
+#   process     -- asyncore.loop, with synchronous scheduling and timeouts
 # 
-class threaded_async_chat(asynchat.async_chat):
+#     Implements a thread-safe version of the traditional asynchat.async_chat
+# and asyncore.loop processing loop supporting arbitrary numbers of
+# asyncore.dispatcher and/or asynchat.async_chat based objects sharing a single
+# socket map.  Presents the Python 2.6 interface, with 2.5 compatibility.
+# 
+#      Using mincemeat.process instead of asyncore.loop also implements
+# auto-firing scheduled events (one-shot or repeating), while strictly
+# respecting the (optional) caller-defined timeout.
+# 
+def process(timeout=None, map=None, schedule=None):
+    """
+    Processes asyncore based Server or Client events 'til none left
+    (or timeout expires), dispatching scheduled events as we go.  On
+    Exception, forcibly cleans up all sockets using the same asyncore
+    map.  Return True while more events may be possible, and the
+    caller should re-invoke.
+
+    If multiple sets of asyncore based objects use separate maps, then
+    each separate map needs to be run using a process (or
+    asyncore.loop) in a separate thread.  For example, a single Python
+    instance may run both a Server, and one or more Clients, or
+    multiple independent Server instances listening on different
+    ports.
+
+    Process asyncore events until the specific timeout (if not None)
+    expires, then return.  There is no guarantee, however, that we
+    will not return slightly after the timeout expires; the overage
+    may be as long as the duration of the longest event handler.
+
+    Unfortunately, we need to have knowledge of how asyncore.loop's
+    exit condition works; it looks at 'map' (or the global
+    asyncore.socket_map), and loops 'til it is empty.  We'll return
+    True while there may be more events to process.
+
+    Since we have elected to try to do "tidy" shutdowns of sockets on
+    controlled exit events (eg. when the Server or Client is directed
+    to terminate due to external events), we need to be able to
+    schedule future events.  In addition, there is a general need in
+    asynchronous event-driven applications to also support timed
+    events.  For example, a timeout on operations that should respond
+    within a certain window.
+
+    Therefore, we don't actually allow unbounded timeouts, and we
+    always specify count=1, to ensure that we return here after
+    processing every I/O event.  Thus, if (during the processing of
+    each event) another scheduled event was added, it will influence
+    the timeout of the next invocation.  It is recommended that a
+    thread-safe container like collections.deque is used, if multiple
+    threads may schedule events.
+    
+    All schedule events are of the form (expiry,callable,repeat),
+    where expiry is a timer() value, and callable is any callable
+    (normally, a bound method of an asyncore.dispatcher based object),
+    and repeat is a number of seconds (or None)
+    """
+    try:
+        if map is None:
+            map = asyncore.socket_map   # Internal asyncore knowledge!
+
+        beg = now = timer()
+        end = None              # Force one loop; computes end below, if timeout
+        while map and (end is None or now < end):
+            # Events on 'map' still possible, and either 'timeout' is infinite,
+            # or we haven't yet reached it.  Trigger scheduled events, and get
+            # earliest expiry remaining in schedule (arbitrary time passes...)
+            nxt = trigger(schedule, now=now)
+            now = timer()
+
+            # Done firing (and rescheduling) any expired events.  The earliest
+            # of the remaining scheduled events (and newly rescheduled events)
+            # is in nxt.  Now, further limit 'nxt' by 'timeout'.  Compute 'end'
+            # for real, to terminate process loop.  Finally, compute remains:
+            # None --> no timeout or other event expiry, 0 --> next scheduled
+            # expiry/timeout already passed, or +'ve --> future expiry.
+            if timeout is not None:
+                end = beg + timeout
+                nxt = minimum_time(nxt, end)
+
+            remains = None
+            if nxt is not None:
+                remains = max(0., nxt - now)
+
+            logging.debug(
+                "mincemeat.process socks: %s, sch: %s, dur: %.6f, rem: %.6f of t/o: %.6f" % (
+                    len(map),
+                    len(schedule) if schedule is not None else None,
+                    now - beg,
+                    remains if remains is not None else float("inf"),
+                    timeout if timeout is not None else float("inf")))
+
+            asyncore.loop(timeout=remains, map=map, count=1)
+            now = timer()
+
+    except Exception, e:
+        # We're no longer running asyncore.loop, so can't do anything cleanly;
+        # just close 'em all...  This should ensure that any socket resources
+        # associated with this object get cleaned up.  In order to ensure that
+        # the original error context gets raised, even if the asyncore.close_all
+        # fails, we must use re-raise inside a try-finally.
+        try:
+            raise
+        finally:
+            close_all(map=map, ignore_all=True)
+
+    # True iff map isn't empty: there may be more asynchronous I/O events
+    return bool(map)
+
+
+def function_name(func):
+    """
+    Return a more human readable name for an (optionally bound) function.
+    """
+    return '.'.join( ([] if not hasattr(func, "im_class") 
+                      else [func.im_class.__name__])
+                     + [func.__name__])
+
+
+def minimum_time(least, *rest):
+    """
+    Computes the minimum of an arbitrary number of wall-clock times (in seconds
+    since the Epoch) or durations (in seconds), where None implies no time or
+    duration.  In other words, any time (including 0.) is greater than None.
+    """
+    for t in rest:
+        if least is None or (t is not None and t < least):
+            least = t
+
+    return least
+
+
+def next_future_time(expiry, repeat, now=None):
+    """
+    Computes the next (future) expiry of a repeating event, relative to 'now'.
+    Returns that expiry time, the number of repeats missed, and the amount
+    we've already passed into the current repeat interval (-'ve if not yet
+    expired!).
+
+    Returns the number of repeat intervals already passed since expiry, and the
+    portion of the next interval already passed (usually ignored -- it embodies
+    the error of the system timer()).
+    
+    Since we don't save the very original scheduled expiry, we ensure it
+    will creep over time by an amount proportional to the limit of the
+    precision of a Python float (ie. not much) -- so we always base exp
+    from itself, NOT now (which may have a much lower precision, on the
+    order of 1ms!)
+    """
+    if now is None:
+        now = timer()
+    if now >= expiry:
+        missed, passed = divmod(now - expiry, repeat)
+        expiry += missed * repeat + repeat
+    else:
+        missed = 0.
+        passed = now - expiry
+
+    return expiry, missed, passed
+
+
+def trigger(schedule, now=None):
+    """
+    Dispatch (and re-schedule) expired scheduled events.  Returns the next
+    scheduled event's expiry (or None).  Modifies the passed schedule.
+    """
+    if not schedule:
+        return None
+    if now is None:
+        now = timer()
+    nxt = None
+    for exp, fun, rpt in sorted(schedule):
+        try:
+            if now >= exp:
+                # Scheduled event expired; Fire fun()!  Arbitrary time passes...
+                logging.debug("Firing scheduled event %s (repeat: %s)" % (
+                        function_name(fun), rpt))
+                fun()
+                now = timer()
+            else:
+                # Scheduled event is in future; done.
+                nxt = minimum_time(nxt, exp)
+                break
+        except Exception, e:
+            # A scheduled event failed; this isn't
+            # considered fatal, but may be of interest...
+            logging.warning("Failed scheduled event %s: %s\n%s" % (
+                    fun, e, traceback.format_exc()))
+    
+        # This event was at or before now (and was fired); remove it and loop to
+        # get next one (if any).
+        schedule.remove((exp, fun, rpt))
+        if rpt:
+            # Repeat is not None/zero.  Careful re-schedule the event.  If we've
+            # already missed one (or more) timeouts, log this fact, and
+            # re-schedule for the next future multiple of repeat interval.
+            exp, mis, pas = next_future_time(exp, rpt, now=now)
+            nxt = minimum_time(nxt, exp)
+            if int(mis):
+                logging.info("Missed %d firings (and %.3f s of next) of scheduled event %s" % (
+                        int(mis), pas, function_name(fun)))
+            schedule.append((exp, fun, rpt))
+
+    return nxt
+
+
+def close_all(map=None, ignore_all=False):
+    """
+    Safely close all sockets, forcing loop (using the same map) to
+    exit.  Handles pre-2.6 asyncore.close_all args.
+    """
+    try:
+        if map is None:
+            map = asyncore.socket_map
+        logging.warning("Forcibly closing remaining %d sockets: %s" % (
+                len(map), repr.repr(map)))
+        asyncore.close_all(map=map, ignore_all=True)
+    except TypeError:
+        # Support pre-2.6 asyncore; no ignore_all...
+        try: 
+            asyncore.close_all(map=map)
+        except Exception, e:
+            logging.warning("Pre-2.6 asyncore; socket map cleanup incomplete: %s" % (e))
+    
+
+class async_chat(asynchat.async_chat):
     """
     Support multithreaded access to pushing data for transmission on
     the async_chat FIFO.  If any other (non-asyncore.loop) thread
@@ -802,7 +814,17 @@ class threaded_async_chat(asynchat.async_chat):
         return False
 
 
-class Protocol(threaded_async_chat):
+# ##########################################################################
+# 
+# Protocol              -- Core mincemeat communication protocol
+# Client                -- A mincmeat Client registers with a Server, rx. tasks
+# Server                -- A mincmeat Server awaits Clients, issues tasks
+# ServerChannel         -- A Server's channel to one Client
+# TaskManager           -- Breaks Map/Reduct Transactions into tasks
+# 
+#     Building blocks used to construct a Map/Reduce engine.
+# 
+class Protocol(async_chat):
     """
     Implements the basic protocol used by mincement Client instances
     (back to one server), and ServerChannel instances (spawned by
@@ -851,7 +873,7 @@ class Protocol(threaded_async_chat):
         tidy closes won't be used.  However, for backwards compatibility, we'll
         default to hard closes.
         """
-        threaded_async_chat.__init__(self, sock, map=map)
+        async_chat.__init__(self, sock, map=map)
         if schedule is None:
             schedule = collections.deque()
         self.schedule = schedule
@@ -1074,33 +1096,30 @@ class Protocol(threaded_async_chat):
 
     def send_command(self, command, data=None, txn=None):
         """
-        Allows the asyncore.loop thread OR an external thread to
-        compose and send a command, pushing it onto the async_chat
-        FIFO for transmission.  This is thread-safe (due to
-        threaded_async_chat), even though async_chat.push... breaks
-        the transmission into output buffer sized blocks in push, and
-        appends them to a FIFO; simultaneous calls to push could
-        interleave data, but are locked (see threaded_async_chat).  It
-        ultimately initiates an attempt to asyncore.dispatcher.send
-        some data.
+        Allows the asyncore.loop thread OR an external thread to compose and
+        send a command, pushing it onto the async_chat FIFO for transmission.
+        This is thread-safe (due to mincemeat.async_chat), even though
+        asynchat.async_chat.push... breaks the transmission into output buffer
+        sized blocks in push, and appends them to a FIFO; simultaneous calls to
+        push could interleave data, but are locked (see mincemeat.async_chat).
+        It ultimately initiates an attempt to asyncore.dispatcher.send some
+        data.
 
-        When any service is complete, the asyncore.loop service thread
-        will prepare to wait in select/poll, and will call writable(),
-        which will return True because there is data awaiting
-        transmission in the dispatcher's FIFO, so the loop service
-        thread will awaken (later) and send data when there is
-        outgoing buffer available on the socket.
+        When any service is complete, the asyncore.loop service thread will
+        prepare to wait in select/poll, and will call writable(), which will
+        return True because there is data awaiting transmission in the
+        dispatcher's FIFO, so the loop service thread will awaken (later) and
+        send data when there is outgoing buffer available on the socket.
 
         This interface may also be invoked by external threads, via
-        send_command_backchannel (below).  In that case, the
-        asyncore.loop thread (blocking in its own select/poll) will
-        NOT know that output is now ready for sending; until it
-        awakens, the external thread must ensure that the data gets
-        sent, using flush_backchannel.
+        send_command_backchannel (below).  In that case, the asyncore.loop
+        thread (blocking in its own select/poll) will NOT know that output is
+        now ready for sending; until it awakens, the external thread must ensure
+        that the data gets sent, using flush_backchannel.
 
-        The command may or may not contain an optional transaction; we
-        append it, if supplied.  If an (optional) data segment is
-        supplied, its length follows the mandatory ':'
+        The command may or may not contain an optional transaction; we append
+        it, if supplied.  If an (optional) data segment is supplied, its length
+        follows the mandatory ':'
 
             <command>[/<transaction>]:[length]\n
             [data\n]
@@ -1239,7 +1258,7 @@ class Protocol(threaded_async_chat):
             self.addr = addr
         self.name(peer=False)
         logging.info("%s connecting" % (self.name()))
-        threaded_async_chat.connect(self, addr)
+        async_chat.connect(self, addr)
 
     def handle_connect(self):
         """
@@ -1272,7 +1291,7 @@ class Protocol(threaded_async_chat):
         awaiting on authenticated; they'll need to do something else...
         """
         self.condition_changed()
-        threaded_async_chat.close(self)
+        async_chat.close(self)
 
     def handle_close(self):
         """
@@ -2300,7 +2319,8 @@ class ServerChannel(Protocol):
             self.send_command('collectfn', self.store_func(self.server.collectfn))
         self.server.taskmanager.channel_opened(self)
         self.start_new_task()
-    
+
+
 class TaskManager(object):
     """
     Produce a stream of Map/Reduce tasks for all requesting
@@ -3040,6 +3060,20 @@ class Client_HB_daemon(Client_daemon):
                                **kwargs)
 
 
+# ##########################################################################
+# 
+# run_client            -- Implements a simple, standard Map/Reduce client
+# 
+#     When run as:
+# 
+#         python mincemeat.py -p "changeme" [-P port] [hostname]
+# 
+# we will attempt to register on the given port and interface (default is
+# localhost:11235), and implement a simple Map/Reduce client, and process
+# requests.  The complete Map/Reduce client implementation is assumed to be
+# delivered from the Server in the mapfn, collectfn and reducefn supplied via
+# the Protocol.
+# 
 def run_client():
     parser = optparse.OptionParser(usage="%prog [options]", version="%%prog %s"%VERSION)
     parser.add_option("-p", "--password", dest="password", default="", help="password")

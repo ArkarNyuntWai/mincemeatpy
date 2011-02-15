@@ -36,8 +36,7 @@ credentials = {
     'finishfn':         None,
 }
 
-#logging.basicConfig(level=logging.ERROR)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.ERROR)
 
 def slow(fun, amt):
     def wrapper(*args, **kwargs):
