@@ -2882,7 +2882,7 @@ class Server_daemon(Mincemeat_daemon):
 
 class Server_HB(Server):
     """
-    Monitor the Server's Client channel heartbeats.
+    A mincemeat.Server that monitors the Server's Client channel heartbeats.
     """
     def __init__(self, *args, **kwargs):
         Server.__init__(self, *args, **kwargs)
@@ -2988,7 +2988,7 @@ class Client_HB(Client):
         self.allowed = kwargs.get('allowed', None)
         if self.allowed is not None:
             logging.info("%s allowing %.3f s between pongs" % (
-                        self.name(), self.allowed))
+                    self.name(), self.allowed))
         Client.starting(self, *args, **kwargs)
 
     def health(self):

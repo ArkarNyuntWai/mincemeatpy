@@ -10,17 +10,24 @@ Python 2.5 (2.6+ is best).  2.4 doesn't have a compatible hmac/hashlib/sha1
 
 DESCRIPTION
 
-    Applies 2 functions over a datasource:
+    The Map/Reduce Transaction applies 2 functions over a datasource of the
+form:
 
         {name1: corpus1, ..., nameN: corpusN}
 
-in two phases, roughly corresponding to:
+roughly corresponding to:
 
         results = reduce( map( datasource ))
 
 ultimately resulting in results of the form:
 
 	{key1: value, key2: value, ..., keyN: value}
+
+First, the Server distributes each (name: corpus) across all available Clients
+to run the Map function.  Then, once all Map results are collected and merged by
+key, the Server distributes each (key, [value, ...]) to all avaiable Clients to
+run the Reduce function.  Finally, all the Reduce results are collected and
+merged by key, to produce the final results.
 
 
     The Map Phase (distributed accross all clients), takes the data
@@ -31,6 +38,7 @@ and produces:
         (nameN, corpusN)  ==> (key1, [value, ...]), ..., (keyN, [value, ...])
 
     (Server collects all key1 values, ..., keyN values)
+
 
     The Reduce Phase (distributed accross all clients), takes the
 combined data from all of the Map phase results, and sends the data
@@ -45,16 +53,15 @@ for one key to each Client:
         {key1: result, ..., keyN: result}
 
 
-    All communication between Server and Clients occurs asynchronously
-using the standard Python asyncore/asynchat library, and may be
-interspersed with user-defined communication in either direction,
-either from within the application's thread, or from an external
-thread.  Tools are provided to implement arbitrary synchronous events
-such as heartbeats, health checking, soft and hard communications
-shutdown.
+    All communication between Server and Clients occurs asynchronously using the
+standard Python asyncore/asynchat library, and may be interspersed with
+user-defined communication in either direction, either from within the
+application's asynchronous communication thread, or from another thread.  Tools
+are provided to implement arbitrary synchronous events such as heartbeats,
+health checking, and soft or hard communications shutdown.
 
-    API compatibility with Michael Fairley's original mincemeat.py
-from has been largely maintained:
+    API compatibility with Michael Fairley's original mincemeat.py from has been
+largely maintained:
 
         http://remembersaurus.com/mincemeatpy/
 
@@ -145,49 +152,113 @@ specified, and the matching files are word-counted.
 
 USAGE
 
-    Create an instance of mincemeat.Server, and set some attributes
-specifying the desired Map and Reduce functions and a datasource, and
-call the Server.run_server().  Start Client node(s).  They will
-connect to the Server, and begin receiving Map and then Reduce tasks.
-Finally, the Server will print the results.  See example*.py for
-details.
+    Create an instance of mincemeat.Server in your application, and set some
+attributes specifying the desired Map and Reduce functions and a datasource, and
+call the Server.run_server().  Start Client node(s); unless your application
+specifies custom Client.mapfn implementations, a generic client may be started
+on any node, by running:
+
+    python mincemeat.py -p "changeme" [hostname]
+
+where the password "changeme" corresponds to the one specified in your Server
+implementation, and hostname is the network interface your Server binds to
+(default is localhost, so by default all Clients would need to run on the same
+host).  They will eacho connect to the Server, receive their Map/Reduce function
+configurations, and begin receiving Map and then Reduce tasks.  Finally, the
+Server will print the results.  See example*.py for details.
 
 * datasource
 
-    Present your input data in the dict-like form, where one or more
-keys each index a corpus of data.  You may use a dict, or any other
-data structure which implements the iterator protocol (__iter__() and
-next() )for returning all keys, and indexing (__getitem__() to return
-the data for each key.
+    Present your input data in the dict-like form, where one or more keys each
+index a corpus of data.  You may use a dict, or any other data structure which
+implements the iterator protocol (__iter__() and next()) for returning all keys,
+and indexing (__getitem__() to return the data for each key.  Each key must be
+unique, as it is used in mincemeat.py for housekeeping.
 
-* mapfn
 
-    The Map function must accept 2 parameters, representing a name and
-the corpus of data.  It must return an iterator (or a generator) which
-yields (key, value) tuples from the data, which will be returned (as a
-dictionary) as the results of the Map phase.
+* Map Phase: mapfn, collectfn
 
-    The Map function is unique amongst the functions that the user
-must provide; it is the only one that must be implemented as an
-iterator returning (key, value) pairs.  For example, here's a mapfn
-that implements word counting (k is a filename, v is a corpus of
-text):
+    The Map function must accept 2 parameters, representing a name and the
+corpus of data.  It must return an iterator (or a generator) which yields (key,
+value) tuples from the data, which will be returned (as a dictionary) as the
+results of the Map phase.
+
+    The Map function is unique amongst the functions that the user must provide;
+it is the only one that must be implemented as an iterator returning (key,
+value) pairs.  For example, here's a mapfn that implements word counting (k is a
+filename, v is a corpus of text):
 
     def get_lower_simple( k, v ):
         for w in v.split():
             yield w.lower(), 1
 
-    The Map phase always returns a dictionary where each key indexes a
-list [value, value, ...] of all values that where produced with that
-key.  So, at the end of the map phase, we'd see:
+    The Map phase always returns a dictionary where each key indexes a list
+[value, value, ...] of all values that where produced with that key.  So, at the
+end of the map phase, we'd see:
 
     {'a': [1, 1, ..., 1], 'and': [1, 1, ..., 1], ...}
 
-returned to the server.  This works, but is sub-optimal for very large
-jobs; we might want to post-process the Map data in the client.  This
-is where the collectfn is used.
+returned to the server.  This works, but is sub-optimal for very large jobs; we
+might want to post-process the Map data in the client.  This is where the
+collectfn is used.
 
-* collectfn (optional)
+
+** Specialized Map/Reduce Function Configuration
+
+    Normally, you will specify 'mapfn' as a plain function in your Server code
+(not a class or instance method), and you will either specify it as a Server
+attribute:
+
+    def mapfn(k, v):
+       ...
+    s = mincemeat.Server()
+    s.mapfn = mapfn
+    ...
+    s.conn(...)
+
+or, you may supply it in the Server.conn(credentials=...) package:
+
+    s = mincemeat.Server()
+    credentials = {
+        'password': "changeme",
+        'mapfn':    mapfn,
+        ...
+    }
+    s.conn(**credentials)
+
+    To avoid performing the Map or the Reduce phase altogether, you may specify
+None for mapfn or reducefn (but NOT both!):
+
+    s = mincemeat.Server()
+    s.mapfn = None      # Don't perform Map; skip, and send data to Reduce
+or:
+    s.reducefn = None   # Don't perform Reduce; send Map output to results 
+
+This will result in no mapfn (or reducefn) being transmitted to the Client, and
+no Map (or Reduce) tasks being generated; the output of the datasource will be
+immediately sent to the (remaining) Map or Reduce phase.
+
+    Sometimes, however, your Map and/or Reduce functions are simply too complex
+to serialize and transmit from the Server to the (generic) Clients in the
+standard way.  If so, you may specify a fully custom mapfn directly as a method
+of your derived mincemeat.Client class implementation (of course, you won't be
+able to run default "python mincemeat.py ..." clients!)  In your Server code:
+
+    s = mincemeat.Server()
+    s.mapfn = False     # Do Map, to don't transmit a 'mapfn' to Client!
+    s.conn(...)
+
+and in your custom Client implementation:
+
+    class my_client(mincemeat.Client):
+        def mapfn(self, k, v):
+	    ...
+
+Now, you may access any custom data or methods in your Client mapfn() required
+for processing Map tasks.
+
+
+** collectfn (optional)
 
     If the (optional) collectfn is provided, it is applied (in the
 client) after the mapfn is done producing the raw Map (key,value)
@@ -212,38 +283,40 @@ And for consistency, we allow collectfn to also return (key, [value,
         for k, vs in kvi:
             yield k, vs if len(vs) < 10 else [sum(vs)]
 
-    The result of the Map phase is always (key, [value, ...]); the
-collectfn is allowed to return single values or lists; we will always
-wrap any non-list collectfn result value as [value].
+    The result of the Map phase is always (key, [value, ...]); the collectfn is
+allowed to return single values or lists; we will always wrap any non-list
+collectfn result value as [value].
 
-* reducefn
 
-    In the Reduce phase, the the Server send each key,[value, ...] to
-a Client, which reduces it to a key,value result, and sends it back.
-If this is trivial, you may decide to skip the Reduce phase
-altogether; just leave reducefn set to None.  We allow any function
-taking key,[value,...] and returning value:
+* Reduce Phase: reducefn, finishfn
+
+    In the Reduce phase, the the Server send each key,[value, ...] to a Client,
+which reduces it to a key,value result and sends it back.  If this is trivial,
+you may decide to skip the Reduce phase altogether; just leave reducefn set to
+None.  We allow any function taking key,[value,...] and returning value:
 
     function(k, vs) ==> v
 
-or taking an iterator yielding key,[value,...], and itself returing an
-iterable yielding key,value:
+or taking an iterator yielding key,[value,...], and itself returing an iterable
+yielding key,value:
 
     function(iter([(k, vs), ...])) ==> [(k, v), ...]
 
 
-* finishfn (optional)
+** finishfn (optional)
 
-    After all the Map/Reduce is done, the Server runs the (optional)
-finishfn.  Trivial Reduce functions may be run on the Server (instead
-of sending them expensively to the Client), by using finishfn to run
-the Reduce function, instead of assigning it to reducefn.
+    After all the Reduce phase is done, the Server runs the (optional) finishfn.
+This function is presented all Reduce phase data for any finishing required.  In
+fact, if the Reduce function is trivial, you may chose to run it entirely on the
+Server (instead of sending the Reduce phase data expensively to the Client), by
+using finishfn to run the Reduce function, instead of assigning it to reducefn.
 
-* resultfn (optional)
 
-    Fired by the Server as soon as results are available.  If not
-specified, the Server just collects up all results for later access.
-A function taking a transaction ID and results dictionary is required:
+* Result Phase: resultfn (optional)
+
+    Fired by the Server as soon as results are available.  If not specified, the
+Server default resultfn just collects up all results for later access.  A
+function taking a transaction ID and results dictionary is required:
 
     def resultfn(txn, results):
         print "# Transaction ", txn
@@ -253,15 +326,15 @@ A function taking a transaction ID and results dictionary is required:
 
 TOPOLOGY
 
-    In its most simple form, a Map-Reduce cluster has a Server and
-several (perhaps transient) Clients.  The server configures the Client
-appropriately, sends one or more Map and/or Reduce requests to the
-Client, collecting the results.  If the Client fails without returning
-the result, the Server will (eventually) send the same Map/Reduce
-requests to another Client.  When complete, the Server disconnects
-from all Clients and exits.  In all cases, the Server is in control of
-the lifespan of the Clients, and also schedules all of the Map/Reduce
-Tasks, and all constituent Map/Reduce Transactions.
+    In its most simple form, a Map-Reduce cluster has a Server and several
+(perhaps transient) Clients.  The server configures the Client appropriately by
+serializing and sending the appropriate Map and Reduce functions, sends one or
+more Map and/or Reduce requests to the Client, collecting the results.  If the
+Client fails without returning the result, the Server will (eventually) send the
+same Map/Reduce requests to another Client.  When complete, the Server
+disconnects from all Clients and exits.  In all cases, the Server is in control
+of the lifespan of the Clients, and also schedules all of the Map/Reduce Tasks,
+and all constituent Map/Reduce Transactions.
 
                +-------(C)
               /
@@ -272,18 +345,17 @@ Tasks, and all constituent Map/Reduce Transactions.
                +-----(C)
 
 
-    In other typical uses of Map-Reduce, the Clients might be in
-control.  For example, if you have a web server farm with many clients
-created spontaneously by the web server infrastructure, where any each
-process will be a Map-Reduce Client, and any Client may need to
-schedule some Map/Reduce task to be processed across all other
-Clients.  In this case, a Server needs to be elected from among the
-Clients (if none exists yet); another Server may need to be
-re-elected, should one disappear before (or during) processing of some
-Client's task.  Since the Server binds atomically and unilaterally to
-a port, any Client could spawn a thread to implement a Server when it
-fails to connect to an existing one.  Here is an example of a Client
-connecting to a Server hosted as a thread within the same process:
+    In other typical uses of Map-Reduce, the Clients might be in control.  For
+example, if you have a web server farm with many clients created spontaneously
+by the web server infrastructure, where any each process will be a Map-Reduce
+Client, and any Client may need to schedule some Map/Reduce task to be processed
+across all other Clients.  In this case, a Server needs to be elected from among
+the Clients (if none exists yet); another Server may need to be re-elected,
+should one disappear before (or during) processing of some Client's task.  Since
+the Server binds atomically and unilaterally to a port, any Client could spawn a
+thread to implement a Server when it fails to connect to an existing one.  Here
+is an example of a Client connecting to a Server hosted as a thread within the
+same process:
 
                +-------(C)
               /
@@ -293,9 +365,9 @@ connecting to a Server hosted as a thread within the same process:
               \
                +-----(C)
 
-    After that server node fails, the Clients connect to a new one;
-the first one to detect the failure attempts to reconnect and then
-fails, and will spawn a Server thread:
+    After that server node fails, the Clients connect to a new one; the first
+one to detect the failure attempts to reconnect and then fails, and will spawn a
+Server thread:
 
                        (C)-+
                             \
