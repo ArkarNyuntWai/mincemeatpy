@@ -120,14 +120,13 @@ class file_meta(object):
 
 class repeat_command(object):
     """
-    Simply repeat the given command as the key; data is always empty.
-    We don't implement the full sequence protocol (we don't know our
-    length, so provide no __len__()), but that's OK; len() is never
-    used.
+    Simply repeat the given command as the key; data is always the same ("" by
+    defualt).  We don't implement the full sequence protocol (we don't know our
+    length, so provide no __len__()), but that's OK; len() is never used.
     
-    If the default times=None is used, then this object should be used
-    as a datasource only if TaskManager.ONESHOT is specified (send one
-    Map task to each Client).
+    If the default times=None is used, then this object should be used as a
+    datasource only if TaskManager.ONESHOT is specified (send one Map task to
+    each Client).
     """
     def __init__(self, command, data="", times=None):
         self.command = command
@@ -135,8 +134,8 @@ class repeat_command(object):
         self.times = times
     def __iter__(self):
         """
-        Returns a generator expression yielding #@command strings,
-        optionally for the specified number of times.
+        Returns a generator expression yielding #@command strings, optionally
+        for the specified number of times.
         """
         # Contrary to "equivalent code" in documentation, providing
         # None for times doesn't produce infinite itertools.repeat...
@@ -442,7 +441,7 @@ def logchange( who, previous ):
 # Deriving from mincemeat.Mincemeat_daemon
 # 
 #     Pass a 'timeout=#.#' to the constructor, and override the
-# timeout method; timeout wil be invoked by the daemon's service
+# timeout method; timeout will be invoked by the daemon's service
 # thread at the specified interval.  To send commands within timeout; use
 # send_command, NOT send_command_backchannel as required for external
 # thread initiated commands!
@@ -771,5 +770,5 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig( level=logging.WARNING )
+    logging.basicConfig(level=logging.WARNING)
     sys.exit(main())
