@@ -1571,7 +1571,9 @@ class Client(Protocol, Mincemeat_class):
         Instantiate a Map/Reduce Client connection to a server.
         """
         Protocol.__init__(self, map=map, schedule=schedule, shuttout=shuttout)
-        self.mapfn = self.reducefn = self.collectfn = None
+        for attr in ['mapfn', 'collectfn', 'reducefn']:
+            if not hasattr(self, attr):
+                setattr(self, attr, None)
         self.name("Client")
 
     # ----------------------------------------------------------------------
@@ -1802,10 +1804,9 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         self.taskmanager = TaskManager(self)
         self.password = None
 
-        self.mapfn = None
-        self.collectfn = None
-        self.reducefn = None
-        self.finishfn = None
+        for attr in ['mapfn', 'collectfn', 'reducefn', 'finishfn']:
+            if not hasattr(self, attr):
+                setattr(self, attr, None)
 
         self.output = collections.deque()
 
