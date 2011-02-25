@@ -820,7 +820,7 @@ class async_chat(asynchat.async_chat):
 # Client                -- A mincmeat Client registers with a Server, rx. tasks
 # Server                -- A mincmeat Server awaits Clients, issues tasks
 # ServerChannel         -- A Server's channel to one Client
-# TaskManager           -- Breaks Map/Reduct Transactions into tasks
+# TaskManager           -- Breaks Map/Reduce Transactions into tasks
 # 
 #     Building blocks used to construct a Map/Reduce engine.
 # 
@@ -1791,6 +1791,15 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         None, then ServerChannels will be taken down harshly at
         Server.handle_close, because ServerChannel.handle_close will simply
         invoke .close!
+
+        For historical consistency, the TaskManager is set up with the default
+        cycle, etc., which is TaskManager.SINGLEUSE by default -- shut down
+        after datasource is empty.  After creation, if you change a Server 's'
+        TaskManager defaults:
+        
+            s.taskmanager.defaults["cycle"] = TaskManager.PERMANENT
+
+        and it will go IDLE awaiting the next datasource, instead of quitting.
         """
         if map is None:
             # Preserve pre-2.6 compatibility by avoiding map, iff None
@@ -1846,16 +1855,10 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     # 
     def finished(self):
         """
-        Detect if finished, by checking if the TaskManager is between
-        transactions.
-        
-        If you've overridden resultfn to handle results differently,
-        this may not work as you expect; it'll never report "finished"
-        'til after the TaskManager is done the final Map/Reduce
-        transaction!
+        Detect if finished.  If running in cycle == PERMANENT mode, this will
+        never report "finished".
         """
         return self.taskmanager.state in [
-            TaskManager.IDLE,
             TaskManager.FINISHED,
             ]
 
@@ -1873,7 +1876,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         txn, results = self.output.popleft()
         return results
 
-    def authenticated(self, timeout=0.):
+    def authenticated(self):
         """
         Server has no authenticated phase; only its ServerChannel(s)
         do, and they don't report for duty 'til they are done
@@ -2132,8 +2135,15 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         compatibility -- The TaskManager will shut down the Server
         after the Map/Reduce Transaction is complete).
 
-        We update the kwargs with the datasource, puthe the bundle on
+        We update the kwargs with the datasource, put the the bundle on
         deque, and jump-start the TaskManager's idle channels.
+
+        WARNING
+
+        Only invoke this method with the Server's own thread (eg. from within
+        Server.unrecognized_command), or only before the Server.run_server or
+        Server.conn has been invoked (so that no Client's have connected, and
+        hence jump_start() does nothing.
         """
         kwargs.update({'datasource': datasource})
         self.taskmanager.deque.append(kwargs)
@@ -2398,14 +2408,14 @@ class TaskManager(object):
         #   .allocation -- PERMANENT or SINGLEUSE (default)
         #   .retransmit -- % retransmission factor (when extra channels available)
         # 
-        # Any entries not configured (or containing None) are set to
-        # the value in self.defaults.
+        # Any entries not configured (or containing None) are set to the value
+        # in self.defaults, remembered from the args provided.
         self.deque = collections.deque()        # {'attr': value, ...}, ...
         self.defaults = {
             "datasource":       None,           # If None, TaskManager will idle
             "txn":              None,           # Currently running Transaction
-            "allocation":       self.CONTINUOUS,# Allocate tasks 'til datasource empty
-            "cycle":            self.SINGLEUSE, # Shut down Server when complete
+            "allocation":       allocation or self.CONTINUOUS,
+            "cycle":            cycle      or self.SINGLEUSE,
             "retransmit":       5,              # Retransmit re-work to 5% of channels
             }
 
@@ -2413,11 +2423,12 @@ class TaskManager(object):
         self.state = self.IDLE
         self.tasks = tasks or self.MAPREDUCE
 
-        # Track what channels exist, and were last reported as being
-        # up to {addr: (command, timetamp), ...}
+        # Track what channels exist, and were last reported as being up to
         self.channels = {}
 
-        # Finally, initialize remaining attrs to the defaults
+        # Finally, initialize remaining attrs to the defaults.  Change the
+        # .default["attr"] to permanently alter the default behaviour after
+        # TaskManager creation.
         for attr, value in self.defaults.iteritems():
             setattr(self, attr, value)
 
@@ -2513,18 +2524,20 @@ class TaskManager(object):
                     txn, response and response or "", command,
                     detail and detail or ""))
 
-    def jump_start(self, count=None):
+    def jump_start(self, count=None, avoid=None):
         """
-        Any ServerChannels that have gone idle must be manually
-        awakened, whenever there may be a new Transaction tasks to
-        process.  Since this invokes methods that modify self.channels
-        (the dict we're iterating over the items of), iterate over a
-        copy (probably OK in Python 2.x, but dict.items() is destined
-        to return an iterator in the future...)
+        Any ServerChannels that have gone idle must be manually awakened,
+        whenever there may be a new Transaction tasks to process.  Since this
+        invokes methods that modify self.channels (the dict we're iterating over
+        the items of), iterate over a copy (probably OK in Python 2.x, but
+        dict.items() is destined to return an iterator in the future...)
 
-        Optionally limit the number jump-started to count.
+        Optionally limit the number jump-started to count.  Also, avoid the
+        specified channel.
         """
         for chan, activity in list(self.channels.items()):
+            if chan is avoid:
+                continue
             if activity is None:
                 logging.debug("%s jump-starting %s" % (
                         self.server.name(), chan.name()))
@@ -2568,12 +2581,14 @@ class TaskManager(object):
                 logging.warning("%s unrecognized TaskManager configuration: %s " % (
                     self.server.name(), repr.repr(transaction)))
             if channel is not None and self.datasource is not None:
-                # Got a datasource; may be empty (we want to return
-                # empty results), but isn't None; Fire it up
+                # Got a datasource; may be empty (we want to return empty
+                # results), but isn't None; Fire it up.  
                 self.state = self.START
+            elif self.cycle == self.SINGLEUSE:
+                # In the default mode, once the datasource is complete, we're done.
+                self.state = self.FINISHED
             else:
-                # Initial state (no datasource, or not yet appropriate
-                # to start.  Issue any clients an idle task.
+                # PERMANENT, but no datasource.  Issue any clients an idle task.
                 return (None, None, None)
 
         if self.state == self.START:
@@ -2591,57 +2606,52 @@ class TaskManager(object):
                 # If Reduce only, skip the Map phase, passing datasource
                 # key/value pairs straight to the Reduce phase.
                 self.state = self.REDUCING
+            # Jump start all the other channels, falling thru to get a task for
+            # this channel, too.
+            self.jump_start(avoid=channel)
             logging.debug("%s %s (%s)" % (
                     self.server.name(), self.statename[self.state],
                     self.tasksname[self.tasks]))
 
         if self.state in (self.MAPPING, self.REDUCING):
-            # For ONESHOT allocation, we remember in-progress
-            # Map/Reduce tasks by channel, too; as soon as each
-            # channel has .been here, and .done that task, we are done
-            # (any remaining tasks on the map_iter are ignored; it
-            # may indeed be a non-terminating iterator in this mode)!
+            # For ONESHOT allocation, we remember in-progress Map/Reduce tasks
+            # by channel, too; as soon as each live channel has .been here, and
+            # .done that task, we are done (any remaining tasks on the map_iter
+            # are ignored; it may indeed be a non-terminating iterator in this
+            # mode)!  Any new live channels showing up during the process will
+            # get a chance to get work.
             #
-            # We need to be careful to be sensitive to a channel
-            # disappearing; if all other channels are done their
-            # assigned task and are idle, and a channel dies and
-            # is closed, we could hang; we need to jump-start one of
-            # the other channels (if any) and fire its start_new_task
-            # to get the thread back in there to advance our
-            # TaskManager state, or (if the dead channel is the one
-            # one) we must advance to the next state, with NO
-            # (ie. empty) Map results...  This is done via
-            # channel_closed and jump_start.
+            # We need to be careful to be sensitive to a channel disappearing;
+            # if all other channels are done their assigned task and are idle,
+            # and a channel dies and is closed, we could hang; we need to
+            # jump-start one of the other channels (if any) and fire its
+            # start_new_task to get the thread back in there to advance our
+            # TaskManager state, or (if the dead channel is the one one) we must
+            # advance to the next state, with NO (ie. empty) Map results...
+            # This is done via channel_closed and jump_start.
             try:
                 if self.allocation == self.ONESHOT:
-                    # ONESHOT.  Assign tasks to all available channels
-                    # 'til each channel has been assigned work.  We
-                    # never assign re-work in this .allocation mode;
-                    # just idle incoming channels 'til they've all
-                    # completed (or died.)
+                    # ONESHOT.  Assign one task to each channel as it shows up.
+                    # We never assign re-work in this .allocation mode; just
+                    # idle incoming channels 'til they've all completed (or
+                    # died.)
                     if channel in self.been:
-                        # OK, we've already seen this channel... Done?
-                        if self.been.issuperset(self.channels.keys()):
-                            # Yup; all known channels have .been
-                            # assigned work; enter Map/Reduce
-                            # end-game...  This will also support the
-                            # appearance of a new channel at any
-                            # moment during the phase; it'll get work.
-                            raise StopIteration
-                    # This channel hasn't .been yet; remember we
-                    # gave it some work.
+                        # OK, we've already seen this channel. Go check
+                        # if we're Done...
+                        raise StopIteration
+
+                    # This channel hasn't .been yet; remember we gave it work.
                     self.been.add(channel)
                 else:
-                    # CONTINUOUS.  Assign tasks to all available
-                    # channels 'til we run out of work (map_iter
-                    # empty).  Then, retransmit work only when we are
-                    # about to fall below our .retransmit factor of
-                    # non-idle channels.
+                    # CONTINUOUS.  Assign tasks to all available channels 'til
+                    # we run out of work (map_iter empty).  Then, retransmit
+                    # work only when we are about to fall below our .retransmit
+                    # factor of non-idle channels.
                     pass
 
-                # This channel needs a Map/Reduce task item.  Get one
-                # (if available); will raise StopIteration after
-                # map_iter has run out of work.
+                # This channel needs a Map/Reduce task item.  Get one (if
+                # available); will raise StopIteration continually after .items
+                # runs out of tasks, for every channel attempting to get work.
                 item = self.items.next()
                 self.work[item[0]] = item[1]
                 logging.debug("%s %s %s work" % (
@@ -2650,41 +2660,45 @@ class TaskManager(object):
                 return (self.statecommand[self.state], item, self.txn)
 
             except StopIteration:
-                # A complete CONTINUOUS iteration of Map/Reduce task
-                # items is done (or we've given every channel ONESHOT
-                # of work); If CONTINUOUS, pick a random item of those
-                # .working (not yet complete) to re-do, or let the
-                # client go idle.  Since we can allow clients to go
-                # idle, we must remember to wake them up when we
-                # transition to the Reduce phase!
+                # A complete CONTINUOUS iteration of Map/Reduce task .items is
+                # done, or we've given this channel ONESHOT of work (or ran
+                # out); Since we can allow clients to go idle, we must remember
+                # to wake them up when we transition to the Reduce phase!  Check
+                # if we've completed the phase.
                 if self.allocation is self.ONESHOT:
-                    # ONESHOT.  Last one here, shut out the lights...
-                    # (we may have dead (closed) channels in .been
-                    # and/or .done).  If there is no longer any live
-                    # channels in the set difference between the .been
-                    # and .done, we are finished.
+                    # ONESHOT.  Last one here, shut out the lights...  We come
+                    # thru here for every channel that shows up after it's .been
+                    # for work; remeber it's .done.  We may have dead (closed)
+                    # channels in .been and/or .done; also, any fresh live
+                    # channels will go thru (above) and get work.  If there are
+                    # no longer any live channels in the set difference between
+                    # the .been and .done, we are finished.
                     self.done.add(channel)
-                    busy = self.been.difference(
-                        self.done).intersection(
-                            self.channels.keys())
+                    busy = self.been.difference(self.done) \
+                                    .intersection(self.channels.keys())
                     if busy:
+                        # OK, this channel has completed one shot of work, but
+                        # we are awaiting others; just idle it; the thread will
+                        # come back when another channel finishes, or dies.
                         logging.debug("%s %s %s idling (ONESHOT) (%d busy)" % (
                                 self.server.name(), self.statename[self.state],
                                 channel.name(), len(busy)))
                         return (None, None, None)
+
+                    # We've all .been there, .done that; Done!
                     logging.debug("%s %s %s complete (ONESHOT)" % (
                             self.server.name(), self.statename[self.state], 
                             channel.name()))
-                    # We've .been there, .done that; Done!
                 else:
-                    # CONTINUOUS.
+                    # CONTINUOUS.  Pick a random item of those .working (not yet
+                    # complete) to re-do, or let the client go idle.
                     if len(self.work) > 0:
-                        # Channels still working...  Do we want/need
-                        # to schedule some re-work?  Say we have N
-                        # channels, and a % .retransmit; always round
-                        # up (in other words, if any work outstanding,
-                        # and anything other than 0% .retransmit,
-                        # we'll issue at least one channel of rework):
+                        # Channels still working...  Do we want/need to schedule
+                        # some re-work?  Say we have N channels, and a %
+                        # .retransmit; always round up (in other words, if any
+                        # work outstanding, and anything other than 0%
+                        # .retransmit, we'll issue at least one channel of
+                        # rework):
                         # 
                         #      N    %               # Chans. Rework:
                         #     --   --               __
@@ -2717,18 +2731,20 @@ class TaskManager(object):
                         logging.debug("%s Finishing (skipping Reduce)" % (
                                 self.server.name()))
                     else:
-                        # Mapping done; start Reducing.  Restart all
-                        # idle channels (this is ultimately a
-                        # recursive call; however, we've already
-                        # advanced .state to REDUCING, so we'll be the
-                        # only thread of control that ends up here...
+                        # Mapping done; start Reducing.  Restart all idle
+                        # channels (this is ultimately a recursive call;
+                        # however, we've already advanced .state to REDUCING, so
+                        # we'll be the only thread of control that ends up
+                        # here...
                         logging.debug("%s Reducing" % (self.server.name()))
                         self.state = self.REDUCING
                         self.items = self.results.iteritems()
                         self.work = {}
                         self.results = {}
-                        self.jump_start()
-                        # Fall through and Loop to REDUCING state
+                        self.jump_start(avoid=channel)
+                        # Fall through and Loop to REDUCING state.  We just jump
+                        # started all the other channels; we'll be falling thru
+                        # and getting a task for this channel, too.
                 else:
                     # REDUCING done
                     self.state = self.FINISHING
@@ -2744,17 +2760,17 @@ class TaskManager(object):
                 self.results \
                     = dict(applyover(self.server.finishfn,
                                      self.results.iteritems()))
-            self.state = self.FINISHED
 
-        if self.state == self.FINISHED:
-            # All done; results ready.  Invoke (optionally overridden
-            # or redefined) .resultfn with results.  Stop accepting
-            # new Client connections, and send ga 'disconnect' to each
-            # client that asks for a new task.
+            # All done; results ready.  Invoke (optionally overridden or
+            # redefined) .resultfn with results.
             logging.info("%s Results: %s" % (
                     self.server.name(), repr.repr(self.results)))
             self.server.resultfn(self.txn, self.results)
+            self.state = self.FINISHED
 
+        if self.state == self.FINISHED:
+            # If not PERMANENT, stop accepting new Client connections, and send
+            # a 'disconnect' to each client that asks for a new task.
             if self.cycle == self.PERMANENT:
                 self.state = self.IDLE
                 # Fall through and Loop to IDLE state

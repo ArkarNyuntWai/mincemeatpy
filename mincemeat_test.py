@@ -36,7 +36,7 @@ credentials = {
     'finishfn':         None,
 }
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.DEBUG)
 
 def slow(fun, amt):
     def wrapper(*args, **kwargs):
@@ -214,7 +214,7 @@ def test_example():
 
     # Since we are running multiple asyncore-based Clients and a
     # Server in separate threads, we need to specify map={} for the
-    # Cliens, so they all don't use the (default) global asyncore
+    # Clients, so they all don't use the (default) global asyncore
     # socket map as the Server...
     logging.info("Starting %d clients...", count)
     for _ in xrange(count):
@@ -256,3 +256,116 @@ def test_example():
         }.iteritems())
     assert results == expected
 
+import itertools
+class repeat_command(object):
+    """
+    Simply repeat the given command as the key; data is always the same ("" by
+    default).  We don't implement the full sequence protocol (we don't know our
+    length, so provide no __len__()), but that's OK; len() is never used.
+    
+    If the default times=None is used, then this object should be used as a
+    datasource only if TaskManager.ONESHOT is specified (send one Map task to
+    each Client).
+    """
+    def __init__(self, command, data="", times=None):
+        self.command = command
+        self.data = data
+        self.times = times
+
+    def __iter__(self):
+        """
+        Returns a generator expression yielding #@command strings, optionally
+        for the specified number of times.
+        """
+        # Contrary to "equivalent code" in documentation, providing None for
+        # times doesn't produce infinite itertools.repeat...
+        if self.times is None:
+            args = (self.command,)
+        else:
+            args = (self.command, self.times)
+        return ("%d@%s" % (idx, cmd) for idx, cmd in
+                enumerate(itertools.repeat(*args)))
+
+    def __getitem__(self, key):
+        return self.data
+
+def map_identity( k, v ):
+    yield k, 1
+
+def test_oneshot():
+    """
+    Tests a ONESHOT Server with a pool of Clients.
+    
+    Starts 1-5 Client threads, and tries to schedule a number of distinct
+    TaskManager.ONESHOT Map/Reduce Transactions.
+    """
+
+    # Since we are running multiple asyncore-based Clients and a
+    # Server in separate threads, we need to specify map={} for the
+    # Clients, so they all don't use the (default) global asyncore
+    # socket map as the Server...
+
+    # First, start up several clients, delayed by a second.  This will
+    # result in several Clients starting at roughly the same time; but they
+    # won't all be available
+    clients = random.randint(3,10)
+    logging.info("Starting %d clients...", clients)
+    for _ in xrange(clients):
+        c = mincemeat.Client(map={})
+        t = threading.Timer(1.0, c.conn,
+                        args=("", mincemeat.DEFAULT_PORT+99),
+                        kwargs={"password": "changeme"})
+        t.daemon = True
+        t.start()
+
+    # Our map function simply returns one key, value from each Client: the
+    # unique number assigned to the client, mapped to the value 1.
+    # 
+    # The server is running permanently, so the server thread will not
+    # return
+    sd = mincemeat.Server_daemon(
+        credentials={
+            "password": "changeme",
+            "port":     mincemeat.DEFAULT_PORT+99,
+            "mapfn":  map_identity,
+            })
+
+    # Server's default TaskManager cycle is SINGLEUSE; will shut down after last
+    # datasource complete.
+
+    # Set up a number of Map/Reduce Transactions.  Each of these will complete
+    # with whatever number of clients are authenticated by that time.  This
+    # should increase, as we go thru the Transactions...
+    transactions = random.randint(3, 10)
+    logging.info("Running %d transactions...", transactions)
+    for t in xrange(transactions):
+        sd.endpoint.set_datasource(
+            datasource = repeat_command( command="%d%s" % (
+                    t, {1:"st", 2:"nd", 3:"rd"}.get(t,"th"))),
+            allocation = mincemeat.TaskManager.ONESHOT,
+            cycle      = mincemeat.TaskManager.PERMANENT )
+
+    # Run server 'til all datasources are complete, then check Server's .output
+    # for multiple results.
+    sd.start()
+    state = None
+    while not sd.endpoint.finished():
+        newstate = sd.endpoint.taskmanager.state
+        if newstate != state:
+            print mincemeat.TaskManager.statename[newstate]
+            state = newstate
+        time.sleep(.1)
+    sd.stop()
+
+    expected = {}
+    length = len(sd.endpoint.output)
+    assert length == transactions
+
+    last = None
+    result = sd.endpoint.results()
+    while result is not None:
+        logging.info("Result: %s" % result)
+        if last is not None:
+            assert len(result) >= len(last)
+        last = result
+        result = sd.endpoint.results()
