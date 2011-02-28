@@ -585,16 +585,11 @@ class Svr(mincemeat.Server_HB_daemon):
 
     Specify our custom mincemeat.Server* class; everything else passes
     through unscathed; we use the default hearbeat timing parameters.
-
-    However, we want to process multiple datasources without exiting, so change
-    the default TaskManager cycle to PERMANENT.
     """
     def __init__(self, credentials, cls=Server_HB_Repl,
                  **kwargs):
         mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls,
                                             **kwargs)
-        self.endpoint.taskmanager.defaults["cycle"] \
-                        = mincemeat.TaskManager.PERMANENT
 
 
 def REPL( cli ):
@@ -666,12 +661,15 @@ def main():
         'interface':        'localhost',
         'port':             options.port,
     
-        'datasource':       None,   # Causes TaskManager to stay idle
+        # Causes TaskManager to stay idle awaiting Transactions
+        'datasource':       None,
+        'cycle':            mincemeat.TaskManager.PERMANENT,
+
         'mapfn':            mapfn,
         'collectfn':        collectfn,
         'reducefn':         reducefn,
         'finishfn':         finishfn,
-        'resultfn':         resultfn
+        'resultfn':         resultfn,
     }
 
 

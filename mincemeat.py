@@ -1582,29 +1582,28 @@ class Client(Protocol, Mincemeat_class):
     def conn(self, interface="", port=DEFAULT_PORT, password=None,
              asynchronous=False, **kwargs):
         """
-        Establish Client connection, and (optionally) synchronously
-        loop 'til all file descriptors closed.  Optionally specifies
-        password.  Note that order is different than
-        Server.run_server, for historical reasons.  Ignores additional
-        unrecognized keyward args, so that identical packages of
-        configuration may be used for both a Client.conn and a
+        Establish Client connection, and (optionally) synchronously loop 'til
+        all file descriptors closed.  Optionally specifies password.  Note that
+        order is different than Server.run_server, for historical reasons.
+        
+        We iggnore additional unrecognized keyward args, so that identical
+        packages of configuration may be used for both a Client.conn and a
         Server.conn call.
         
-        If no server port exists to bind to, on Windows the
-        select.select() call will return an "exceptional" condition on
-        the socket; on *nix, a "readable" condition (and a
-        handle_connect()), followed by an error on read (errno 11,
-        "Resource temporarily unavailable") and a handle_close().  In
-        either case, on the loopback interface, this occurs in ~1
-        second.
+        If no server port exists to bind to, on Windows the select.select()
+        call will return an "exceptional" condition on the socket; on *nix, a
+        "readable" condition (and a handle_connect()), followed by an error on
+        read (errno 11, "Resource temporarily unavailable") and a
+        handle_close().  In either case, on the loopback interface, this occurs
+        in ~1 second.
 
-        Since this connection is performed asynchronously, the invoker
-        may want to check that .auth is 'Done' after this call, to
-        ensure that we successfully connected to and authenticated a
-        server...
+        Since this connection is performed asynchronously, the invoker may want
+        to check that the client is authenticated (perhaps with a timeout)
+        after this call, to ensure that we successfully connected to and
+        authenticated a server...
         
-        Since the default kernel socket behavior for interface == ""
-        is inconsistent, we'll choose "localhost".
+        Since the default kernel socket behavior for interface == "" is
+        inconsistent, we'll choose "localhost".
         """
         for k, v in kwargs.iteritems():
             logging.info("%s conn ignores %s = %s" % (
@@ -1800,6 +1799,14 @@ class Server(asyncore.dispatcher, Mincemeat_class):
             s.taskmanager.defaults["cycle"] = TaskManager.PERMANENT
 
         and it will go IDLE awaiting the next datasource, instead of quitting.
+
+        A number of configurations may be specified *either* in the derived
+        Server class' attributes, *or* in the package of Server.conn's
+        'credentials':
+
+            *fn    -- all of the Map and Reduce phase functions
+            cycle  -- the default TaskManager.cycle setting (None --> default)
+
         """
         if map is None:
             # Preserve pre-2.6 compatibility by avoiding map, iff None
@@ -1813,7 +1820,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         self.taskmanager = TaskManager(self)
         self.password = None
 
-        for attr in ['mapfn', 'collectfn', 'reducefn', 'finishfn']:
+        for attr in ['mapfn', 'collectfn', 'reducefn', 'finishfn', 'cycle']:
             if not hasattr(self, attr):
                 setattr(self, attr, None)
 
@@ -1901,24 +1908,25 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     def conn(self, password="", port=DEFAULT_PORT, interface="",
              asynchronous=False, **kwargs):
         """
-        Establish this Server, allowing Clients to connect to it.
-        This will allow exactly one Server bound to a specific port to
-        accept incoming Client connections.  Any additional keyword
-        args are assumed to be (optional) values for Server attributes
-        (eg. .datasource, .mapfn, ...)  Any values passed are only
-        used if they are non-None; in other words, a None value will
-        not override a valid default value (such as for resultfn,
-        where the default behavior saves the results for later access!
+        Establish this Server, allowing Clients to connect to it.  This will
+        allow exactly one Server bound to a specific port to accept incoming
+        Client connections.
 
-        If asynchronous, then we will not initiate processing; it is
-        the caller's responsibility to do so; every Client and/or
-        Server with a shared map=... require only one
-        asyncore.loop(map=obj._map) or obj.process() thread.
+        Any additional keyword args are assumed to be (optional) values for
+        Server attributes (eg. .datasource, .mapfn, .cycle, ...)  Any values
+        passed are only used if they are non-None; in other words, a None value
+        will not override a valid default value (such as for resultfn, where
+        the default behavior saves the results for later access!
+
+        If asynchronous, then we will not initiate processing; it is the
+        caller's responsibility to do so; every Client and/or Server with a
+        shared map=... require only one asyncore.loop(map=obj._map) or
+        obj.process() thread.
 
         The default behaviour of bind when interface == '' is pretty
         consistently to bind to all available interfaces.
 
-        We'll set self.addr early (it is set in asyncore.bind), for
+        We'll set self.addr early (it is also set in asyncore.bind), for
         logging purposes.
         """
         addr = (interface, port)
@@ -1982,6 +1990,11 @@ class Server(asyncore.dispatcher, Mincemeat_class):
             self.taskmanager.tasks = TaskManager.MAPONLY
         elif self.mapfn is None:
             self.taskmanager.tasks = TaskManager.REDUCEONLY
+
+        # The 'credentials' package, or the a Server derived class may change
+        # this default.
+        if self.cycle is not None:
+            self.taskmanager.defaults["cycle"] = self.cycle
 
         if asynchronous is False:
             self.process()
@@ -2399,17 +2412,18 @@ class TaskManager(object):
     def __init__(self, server,
                  tasks=None, allocation=None, cycle=None):
 
-        # The datasources, etc. configurations on deque ;) Contains
-        # dicts configuring:
+        # The datasources, etc. configurations on deque ;) Contains dicts
+        # configuring:
         # 
         #   .datasource -- A dict-like name/corpus source
         #   .txn        -- A transaction ID to use (None default)
-        #   .cycle      -- ONESHOT or CONTINUOUS (default)
-        #   .allocation -- PERMANENT or SINGLEUSE (default)
+        #   .allocation -- ONESHOT or CONTINUOUS (default)
+        #   .cycle      -- PERMANENT or SINGLEUSE (default)
         #   .retransmit -- % retransmission factor (when extra channels available)
         # 
         # Any entries not configured (or containing None) are set to the value
         # in self.defaults, remembered from the args provided.
+
         self.deque = collections.deque()        # {'attr': value, ...}, ...
         self.defaults = {
             "datasource":       None,           # If None, TaskManager will idle
@@ -2428,7 +2442,8 @@ class TaskManager(object):
 
         # Finally, initialize remaining attrs to the defaults.  Change the
         # .default["attr"] to permanently alter the default behaviour after
-        # TaskManager creation.
+        # TaskManager creation, but ideally before the first invocation of
+        # next_task.
         for attr, value in self.defaults.iteritems():
             setattr(self, attr, value)
 
@@ -2885,11 +2900,11 @@ class Server_daemon(Mincemeat_daemon):
     which to forward along for threading.Thread to pass to the target=
     method...
 
-    In summary: override process in *_daemon, and
-    trap custom keyword parameters there.  Use keywords only;
-    positional parameters are not supported -- only the (required)
-    credentials argument is positional, and must be provided, in first
-    position, in every overridden Mincemeat_daemon.__init__.
+    In summary: override process in *_daemon, and trap custom keyword
+    parameters there.  Use keywords only; positional parameters are not
+    supported -- only the (required) credentials argument is positional, and
+    must be provided, in first position, in every overridden
+    Mincemeat_daemon.__init__.
     """
     def __init__(self, credentials, cls=Server,
                  **kwargs):

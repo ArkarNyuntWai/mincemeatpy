@@ -9,6 +9,15 @@ import time
 
 import mincemeat
 
+# We don't want port interference between tests, due to
+# kernel-specific i'face:port timeouts; 
+
+testcount = 0
+def unique_port(port):
+    return port + 99 + testcount
+
+logging.basicConfig(level=logging.ERROR)
+
 
 data = ["Humpty Dumpty sat on a wall",
         "Humpty Dumpty had a great fall",
@@ -27,7 +36,7 @@ def reducefn(k, vs):
 credentials = {
     'password':         'changeme',
     'interface':        'localhost',
-    'port':             mincemeat.DEFAULT_PORT,
+    'port':             None,   # Invalid; must be updated before use
 
     'datasource':       None,   # Causes TaskManager to stay idle
     'mapfn':            mapfn,
@@ -35,8 +44,6 @@ credentials = {
     'reducefn':         reducefn,
     'finishfn':         None,
 }
-
-logging.basicConfig(level=logging.DEBUG)
 
 def slow(fun, amt):
     def wrapper(*args, **kwargs):
@@ -66,6 +73,9 @@ def test_basic():
     """
     Tests basic time and scheduling core functionality.
     """
+    global testcount
+    testcount += 1
+
     sch = collections.deque()
 
     # An arbitrarily small repeat interval will result in one triggering
@@ -87,7 +97,14 @@ def test_bind():
     """
     Tests that socket binding exclusion works.
     """
-    s1 = mincemeat.Server_daemon(credentials=credentials, timeout=5.)
+    global testcount
+    testcount += 1
+
+    port = unique_port( mincemeat.DEFAULT_PORT )
+    cred = credentials.copy()
+    cred.update({"port": port})
+    
+    s1 = mincemeat.Server_daemon(credentials=cred, timeout=5.)
     state = s1.state()
     assert state == "idle"
     s1.start()
@@ -97,35 +114,49 @@ def test_bind():
 
     try:
         s2 = mincemeat.Server()
-        s2.conn(**credentials)
+        s2.conn(**cred)
         assert False == "Should have thrown Exception in bind()!"
     except Exception, e:
         assert "Only one usage of each socket address" in str(e) \
             or "Address already in use" in str(e)
 
+    # Server wasn't provided with a datasource; it will remain idle, and report
+    # failed: incomplete.
     s1.stop()
     state = s1.state()
-    assert state == "success"
+    assert state == "failed: incomplete"
 
-
-def put(thing, queue):
-    logging.info("Putting %s on %s" % (thing, queue))
-    queue.put(thing)
 
 def test_schedule():
     """
     Tests scheduled events.
     """
-    s1 = mincemeat.Server_daemon(credentials=credentials)
+    global testcount
+    testcount += 1
+
+    # Configure the Server to go idle awaiting Transactions, so we can test
+    # scheduling, and response to manually tearing down the Server.
+    port = unique_port( mincemeat.DEFAULT_PORT )
+    cred = credentials.copy()
+    cred.update({
+            "port":  port,
+            "cycle": mincemeat.TaskManager.PERMANENT
+            })
+    
+    s1 = mincemeat.Server_daemon(credentials=cred)
     s1.start()
 
+    def put(thing, queue):
+        logging.info("Putting %s on %s" % (thing, queue))
+        queue.put(thing)
+
+    # Wait 1 second, and put something on 'res' Queue
     res = Queue.Queue()
     sch = collections.deque()
- 
-    # Wait 1 second, and put something on 'res' Queue
     then = mincemeat.timer() + 1.
     sch.append((then, lambda: put(mincemeat.timer(), res), None))
-    c1 = mincemeat.Client_daemon(credentials=credentials, schedule=sch)
+
+    c1 = mincemeat.Client_daemon(credentials=cred, schedule=sch)
     beg = mincemeat.timer()
     c1.start()
     now = mincemeat.timer()
@@ -172,12 +203,12 @@ def test_schedule():
         # 
     
         svrchn = s1.endpoint.taskmanager.channels.keys()[0]
-        getstate = lambda count: (c1.endpoint.closed,
+        getstate = lambda number: (c1.endpoint.closed,
                                   svrchn.closed,
                                   c1.endpoint.shutdown, 
-                                  count)
-        count = 0
-        last = getstate(count); count += 1
+                                  number)
+        cycle = 0
+        last = getstate(cycle); cycle += 1
         assert last == (False, False, False, 0)
         start = now = mincemeat.timer()
     
@@ -185,7 +216,7 @@ def test_schedule():
     
         logging.info("%s: %s" % (time.ctime(), last))
         while ( now - start < 1. ):
-            state = getstate(count); count += 1
+            state = getstate(cycle); cycle += 1
             if state[:-1] != last[:-1]:
                 logging.info("%s: %s" % (time.ctime(), state))
             assert state > last
@@ -209,18 +240,23 @@ def test_example():
     Starts 1-5 Client threads, and scales up the text corpus a bit, proportional
     to the number of threads we choose.
     """
-    count = random.randint(1,5)
-    scale = count * 73
+    global testcount
+    testcount += 1
+
+    port = unique_port( mincemeat.DEFAULT_PORT )
+
+    clients = random.randint(1,5)
+    scale = clients * 73
 
     # Since we are running multiple asyncore-based Clients and a
     # Server in separate threads, we need to specify map={} for the
     # Clients, so they all don't use the (default) global asyncore
     # socket map as the Server...
-    logging.info("Starting %d clients...", count)
-    for _ in xrange(count):
+    logging.info("Starting %d clients...", clients)
+    for _ in xrange(clients):
         c = mincemeat.Client(map={})
         t = threading.Timer(1.0, c.conn,
-                        args=("", mincemeat.DEFAULT_PORT),
+                        args=("", port),
                         kwargs={"password": "changeme"})
         t.daemon = True
         t.start()
@@ -231,7 +267,7 @@ def test_example():
     s.reducefn = reducefn
     
     now = mincemeat.timer()
-    results = s.run_server(password="changeme")
+    results = s.run_server(password="changeme", port=port)
     expected = dict((k, v*scale) for k,v in {
         'All': 1,
         "Couldn't": 1,
@@ -299,6 +335,8 @@ def test_oneshot():
     Starts 1-5 Client threads, and tries to schedule a number of distinct
     TaskManager.ONESHOT Map/Reduce Transactions.
     """
+    global testcount
+    testcount += 1
 
     # Since we are running multiple asyncore-based Clients and a
     # Server in separate threads, we need to specify map={} for the
@@ -310,10 +348,13 @@ def test_oneshot():
     # won't all be available
     clients = random.randint(3,10)
     logging.info("Starting %d clients...", clients)
+
+    port = unique_port( mincemeat.DEFAULT_PORT )
+
     for _ in xrange(clients):
         c = mincemeat.Client(map={})
         t = threading.Timer(1.0, c.conn,
-                        args=("", mincemeat.DEFAULT_PORT+99),
+                        args=("", port),
                         kwargs={"password": "changeme"})
         t.daemon = True
         t.start()
@@ -326,8 +367,8 @@ def test_oneshot():
     sd = mincemeat.Server_daemon(
         credentials={
             "password": "changeme",
-            "port":     mincemeat.DEFAULT_PORT+99,
-            "mapfn":  map_identity,
+            "port":     port,
+            "mapfn":    map_identity,
             })
 
     # Server's default TaskManager cycle is SINGLEUSE; will shut down after last
