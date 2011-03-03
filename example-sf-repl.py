@@ -490,9 +490,11 @@ class Server_HB_Repl(mincemeat.Server_HB):
 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
-        Schedule a future Map/Reduce transaction.  The Client's 'txn'
-        will be used when sending back the results in the
-        corresponding "transactiondone" response.  
+        Schedule a future Map/Reduce transaction.  The Client's 'txn' will be
+        used when sending back the results in the corresponding
+        "transactiondone" response.  We are invoking set_datasource from within
+        an asyncore.loop callback, so an IDLE Server TaskManager will always be
+        immediately awakened.
 
         The local Map/Reduce transaction performed by our TaskManager
         will generate its own 'txn', independent of this one created

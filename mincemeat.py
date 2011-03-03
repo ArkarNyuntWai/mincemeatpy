@@ -734,14 +734,16 @@ class async_chat(asynchat.async_chat):
                     # asyncore.loop emptied us; we're done.
                     break
 
-            # We checked, tried to send, and checked again; we still
-            # have data to send, and asyncore.loop's select still
-            # doesn't know about it!  We are out of the lock now, so
-            # the asyncore.loop thread may now awaken (if it has
-            # detected some other activity), and then take note that
-            # there is data to send.  If we have time, wait...
+            # We checked, tried to send, and checked again; we still have data
+            # to send, and asyncore.loop's select still doesn't know about it!
+            # We are out of the lock now, so the asyncore.loop thread may now
+            # awaken (if it has detected some other activity), and then take
+            # note that there is data to send.  If we have time, and our fileno
+            # is still valid, wait...
+            fileno = self._fileno
             elapsed = timer() - now
-            if timeout is not None and elapsed >= timeout:
+            if fileno is None or ( timeout is not None
+                                   and elapsed >= timeout ):
                 break
             
             # We're not empty, and asyncore.loop doesn't yet know.
@@ -749,15 +751,17 @@ class async_chat(asynchat.async_chat):
             # If timeout is None or 0, it is used as-is; otherwise,
             # the remaining duration is computed.  Wait a bit.
             try:
-                r, w, e = select.select([], [self._fileno], [self._fileno],
-                                        timeout and timeout - elapsed or timeout)
+                r, w, e = select.select([], [fileno], [fileno],
+                                        ( timeout
+                                          and ( timeout - elapsed )
+                                          or timeout ))
                 if e:
                     self.handle_expt()
             except select.error, e:
-                # Anything that wakes us up harshly will wake up the
-                # main loop's select.  Done (except ignore
-                # well-behaved interrupted system calls).
                 if e.arg[0] != errno.EINTR:
+                    # Anything that wakes us up harshly will also wake up the
+                    # main loop's select; Done (except ignore well-behaved
+                    # interrupted system calls).
                     break
 
     def close(self):
@@ -1807,6 +1811,8 @@ class Server(asyncore.dispatcher, Mincemeat_class):
             *fn    -- all of the Map and Reduce phase functions
             cycle  -- the default TaskManager.cycle setting (None --> default)
 
+        We ensure that these are all initialized to None, if not defined
+        in a derived class.
         """
         if map is None:
             # Preserve pre-2.6 compatibility by avoiding map, iff None
@@ -1828,8 +1834,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
     def resultfn(self, txn, results):
         """
-        By default, just collect up the results in the self.output
-        deque.
+        By default, just collect up the results in the self.output deque.
 
         This may be overridden in a derived class:
 
@@ -2128,40 +2133,82 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         # we are were not asynchronous.
         return self.results()
 
+    def tickle(self):
+        """
+        Tickle an IDLE Server awake.
+
+        Must be invoked from within the Server's asyncore.loop thread.
+        """
+        if ( self.taskmanager.deque
+             and self.taskmanager.state == TaskManager.IDLE
+             and self.taskmanager.channels ):
+            self.taskmanager.jump_start(count=1)
+
     def set_datasource(self, datasource=None, **kwargs):
         """
-        Sets the TaskManager datasource, which is expected to be a
-        dict-like object, implementing at least the iterator protocol
-        (.__iter__() returning something with .__iter__() and
-        .next()), and the sequence protocol (at least the
-        .__getitem__() method; .__len__() is not used).
+        Sets the TaskManager datasource, which is expected to be a dict-like
+        object, implementing at least the iterator protocol (.__iter__()
+        returning something with .__iter__() and .next()), and the sequence
+        protocol (at least the .__getitem__() method; .__len__() is not used).
         
-        Set (or enqueue) a Map/Reduce Transaction, starting
-        the TaskManager if it is idle.  The first positional parameter
-        is presumed to be datasource (eg. when invoked via the
-        self.datasource property); any other keyword args are
-        presumed to be configuration parameters for the TaskManager.
+        Set (or enqueue) a Map/Reduce Transaction, starting the TaskManager if
+        it is idle.  The first positional parameter is presumed to be datasource
+        (eg. when invoked via the self.datasource property); any other keyword
+        args are presumed to be configuration parameters for the TaskManager.
 
-        This method (when called directly) allows specifying other
-        TaskManager parameters, such as cycle=TaskManager.PERMANENT
-        (the default is TaskManager.SINGLEUSE, for historical
-        compatibility -- The TaskManager will shut down the Server
-        after the Map/Reduce Transaction is complete).
+        This method (when called directly) allows specifying other TaskManager
+        parameters, such as cycle=TaskManager.PERMANENT (the default is
+        TaskManager.SINGLEUSE, for historical compatibility -- The TaskManager
+        will shut down the Server after the Map/Reduce Transaction is complete).
 
-        We update the kwargs with the datasource, put the the bundle on
-        deque, and jump-start the TaskManager's idle channels.
+        We update the kwargs with the datasource (which is required to be the
+        first positional parameter), and put the the bundle on deque.
 
-        WARNING
+        The temptation might be to jump-start the TaskManager's idle channels.
+        However, this method may easily be invoked by threads other than the
+        asyncore thread!  So, how do we ensure we awaken if a non-I/O thread
+        sets a datasource, and the TaskManager is completely idle, and there is
+        no I/O activity?  How can we ensure that at least one idle ServerChannel
+        awakens and invokes start_new_task?
 
-        Only invoke this method with the Server's own thread (eg. from within
-        Server.unrecognized_command), or only before the Server.run_server or
-        Server.conn has been invoked (so that no Client's have connected, and
-        hence jump_start() does nothing.
+        The truth is, we cannot deduce whether we can safely do this: we don't
+        know what thread may be running the asyncore.loop for the Server (and
+        all its ServerChannels).  Historically, invoking mincemeatpy's
+        Server.set_datasource never started processing; it only prepared the
+        TaskManager for the future arrival of new ServerChannels, which
+        (ultimately) would invoke .start_new_task at the end of their
+        Authentication process, from .post_auth_init.
+
+        Therefore, it must be left to the implementation to ensure that that
+        asyncore.loop thread will check, and if the TaskManager is IDLE and
+        there are now datasources in TaskManager.deque, that we jump_start a
+        ServerChannel.  TaskManager.next_task will then (safely) fire up all
+        remaining idle channels as it transitions from the IDLE to START state.
+
+        The simplest method is to ensure that Server.set_datasource is invoked
+        from within the asyncore.loop thread (eg. from within a *_command or
+        other callback), and that we invoke Server.tickle.
+
+        If an external thread does invoke set_datasource, then the application
+        truly requires an asynchronous means to awaken the asyncore.loop thread
+        stuck in select.  Unfortunately, this is pretty trivial on Posix
+        platforms (using os.pipe), but a significant problem for Windows:
+
+            http://svn.zope.org/zc.ngi/trunk/src/zc/ngi/async.py?rev=69400&view=markup
+
+        So, we'll do our best: we'll schedule an immediate self.tickle, which
+        will be run as soon as the next I/O event occurs on any Server or
+        ServerChannel file descriptor.  This will be 100% certain to ignite the
+        Transaction, when set_datasource is called from within an asyncore.loop
+        callback, and will ignite processes as soon as possible when called from
+        any other context.
         """
         kwargs.update({'datasource': datasource})
         self.taskmanager.deque.append(kwargs)
-        self.taskmanager.jump_start()
-    
+        logging.info("%s setting datasource (now %d): %s" % (
+                self.name(), len(self.taskmanager.deque), repr.repr(kwargs)))
+        self.schedule.append( (0.0, self.tickle, None) )
+
     def get_datasource(self):
         """
         Returns the TaskManager's currently active datasource.  This
@@ -2538,7 +2585,7 @@ class TaskManager(object):
                     chan.name(), time.time() - when, what,
                     txn, response and response or "", command,
                     detail and detail or ""))
-
+                                  
     def jump_start(self, count=None, avoid=None):
         """
         Any ServerChannels that have gone idle must be manually awakened,
@@ -2821,7 +2868,7 @@ class TaskManager(object):
                     self.server.name(), txn, self.txn ))
             return
         if self.state != self.MAPPING or data[0] not in self.work:
-            logging.debug("%s Map result Task duplicate: %s; Ignoring." % (
+            logging.debug("%s Map result Task duplicate/late; Ignorning: %s" % (
                     self.server.name(), repr.repr(data[0])))
             return
         logging.debug("Map Done: %s ==> %s" % (
@@ -2841,7 +2888,7 @@ class TaskManager(object):
                     self.server.name(), txn, self.txn ))
             return
         if self.state != self.REDUCING or data[0] not in self.work:
-            logging.debug("%s Reduce result Task duplicate: %s; Ignoring." % (
+            logging.debug("%s Reduce result Task duplicate/late; Ignoring: %s" % (
                     self.server.name(), repr.repr(data[0])))
             return
         logging.debug("Reduce Done: %s ==> %s" % (

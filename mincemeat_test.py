@@ -16,7 +16,7 @@ testcount = 0
 def unique_port(port):
     return port + 99 + testcount
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.DEBUG)
 
 
 data = ["Humpty Dumpty sat on a wall",
@@ -334,6 +334,13 @@ def test_oneshot():
     
     Starts 1-5 Client threads, and tries to schedule a number of distinct
     TaskManager.ONESHOT Map/Reduce Transactions.
+
+    Transactions are scheduled in 3 ways;
+    1) Before Server startup, named "initial-#"
+    2) From within the Server's, called "scheduled-#"
+    3) From the Client, called "backchannel-#"
+    
+    As soon as the deque of Transaction datasources drains, the Server quits.
     """
     global testcount
     testcount += 1
@@ -351,8 +358,50 @@ def test_oneshot():
 
     port = unique_port( mincemeat.DEFAULT_PORT )
 
+    class monotonic(object):
+        base = 0
+
+        def value(self):
+            self.__class__.base += 1
+            return self.base
+
+        def transaction(self, name):
+            num = self.value()
+            return {
+                "datasource": repeat_command( command="%s-%d%s" % (
+                        name, num,
+                        {1:"st", 2:"nd", 3:"rd"}.get(
+                            num % 100 // 10 != 1 and num % 10 or 0, "th"))),
+                "allocation": mincemeat.TaskManager.ONESHOT,
+                "cycle":      mincemeat.TaskManager.PERMANENT,
+            }
+
+    which = monotonic()
+
+    class Cli(mincemeat.Client):
+        def mapfn( self, k, v ):
+            """
+            The Map function simply returns the identity value for whatever
+            unique key was assigned to the Client.
+
+            On every N'th Map request, it sends a command to the Server!
+            """
+            logging.info( "%s custom mapfn" % self.name() )
+            yield k, 1
+            if random.randint( 0, 19 ) == 0:
+                logging.info("%s sending whatever command!" % (
+                        self.name() ))
+                self.send_command( "whatever" )
+
+    class Svr(mincemeat.Server):
+        def unrecognized_command( self, command, data, txn, chan ):
+            logging.info("%s received command %s from %s" % (
+                    self.name(), command, chan.name() ))
+            self.set_datasource( **which.transaction( "backchannel" ))
+            return True
+
     for _ in xrange(clients):
-        c = mincemeat.Client(map={})
+        c = Cli(map={})
         t = threading.Timer(1.0, c.conn,
                         args=("", port),
                         kwargs={"password": "changeme"})
@@ -361,30 +410,37 @@ def test_oneshot():
 
     # Our map function simply returns one key, value from each Client: the
     # unique number assigned to the client, mapped to the value 1.
-    # 
-    # The server is running permanently, so the server thread will not
-    # return
-    sd = mincemeat.Server_daemon(
+    sd = mincemeat.Server_daemon( cls=Svr,
         credentials={
             "password": "changeme",
             "port":     port,
-            "mapfn":    map_identity,
             })
 
-    # Server's default TaskManager cycle is SINGLEUSE; will shut down after last
-    # datasource complete.
+    # Server's default TaskManager cycle is SINGLEUSE; it will shut down after
+    # last queued datasource (which specify a cycle of PERMANENT) is complete.
+    # Switch to PERMANENT; we'll switch back to SINGLEUSE when we want the test
+    # to end.
+    sd.endpoint.taskmanager.defaults["cycle"] = mincemeat.TaskManager.PERMANENT
+
 
     # Set up a number of Map/Reduce Transactions.  Each of these will complete
     # with whatever number of clients are authenticated by that time.  This
     # should increase, as we go thru the Transactions...
-    transactions = random.randint(3, 10)
-    logging.info("Running %d transactions...", transactions)
+    transactions = random.randint( 3, 10 )
+    logging.info( "Running %d transactions...", transactions )
     for t in xrange(transactions):
-        sd.endpoint.set_datasource(
-            datasource = repeat_command( command="%d%s" % (
-                    t, {1:"st", 2:"nd", 3:"rd"}.get(t,"th"))),
-            allocation = mincemeat.TaskManager.ONESHOT,
-            cycle      = mincemeat.TaskManager.PERMANENT )
+        sd.endpoint.set_datasource( **which.transaction( "initial" ))
+
+    # Also, schedule a sub-second repeating event to schedule another datasource
+    # -- from inside the Server event loop.  This will test that set_datasource
+    # doesn't improperly interfere with processing ongoing Transactions, when
+    # enqueueing another datasource.  We should get at least one of these
+    # scheduled and processed before the Server goes idle and quits...
+    sd.endpoint.schedule.append(
+        ( mincemeat.timer(),
+          lambda: sd.endpoint.set_datasource(
+                **which.transaction( "scheduled" )),
+          0.75 ))
 
     # Run server 'til all datasources are complete, then check Server's .output
     # for multiple results.
@@ -396,11 +452,13 @@ def test_oneshot():
             print mincemeat.TaskManager.statename[newstate]
             state = newstate
         time.sleep(.1)
+        if which.base >= 50:
+            sd.endpoint.taskmanager.defaults["cycle"] = mincemeat.TaskManager.SINGLEUSE
     sd.stop()
 
     expected = {}
     length = len(sd.endpoint.output)
-    assert length == transactions
+    assert length >= transactions # At least one "sched-#" processed...
 
     last = None
     result = sd.endpoint.results()
