@@ -46,8 +46,7 @@ import timeit
 import traceback
 import types
 
-VERSION = 0.0
-
+VERSION = 0.1
 
 DEFAULT_PORT = 11235
 
