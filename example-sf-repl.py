@@ -2,21 +2,22 @@
 
 from __future__ import with_statement
 
+import asyncore
 import collections
+import errno
 import glob
 import itertools
 import logging
+import optparse
 import os
 import repr
+import select
 import socket
-import errno
-import asyncore
+import sys
 import threading
 import time
 import timeit
 import traceback
-import select
-import sys
 
 import mincemeat
 
@@ -417,19 +418,6 @@ def stats_results(txn, results):
 resultfn = None                 # None retains default behaviour
 #resultfn = server_results       # Process directly (using asyncore.loop thread)
 #resultfn = store_results        # Store for processing later by another thread
-
-credentials = {
-    'password':         'changeme',
-    'interface':        'localhost',
-    'port':             mincemeat.DEFAULT_PORT,
-
-    'datasource':       None,   # Causes TaskManager to stay idle
-    'mapfn':            mapfn,
-    'collectfn':        collectfn,
-    'reducefn':         reducefn,
-    'finishfn':         finishfn,
-    'resultfn':         resultfn
-}
     
 def logchange( who, previous ):
     current = who.state()
@@ -502,9 +490,11 @@ class Server_HB_Repl(mincemeat.Server_HB):
 
     def unrecognized_command(self, command, data=None, txn=None, chan=None):
         """
-        Schedule a future Map/Reduce transaction.  The Client's 'txn'
-        will be used when sending back the results in the
-        corresponding "transactiondone" response.  
+        Schedule a future Map/Reduce transaction.  The Client's 'txn' will be
+        used when sending back the results in the corresponding
+        "transactiondone" response.  We are invoking set_datasource from within
+        an asyncore.loop callback, so an IDLE Server TaskManager will always be
+        immediately awakened.
 
         The local Map/Reduce transaction performed by our TaskManager
         will generate its own 'txn', independent of this one created
@@ -652,6 +642,39 @@ def REPL( cli ):
     
 
 def main():
+    parser = optparse.OptionParser(usage="%prog [options]",
+                                   version="%%prog %s" % mincemeat.VERSION)
+    parser.add_option("-p", "--password", dest="password",
+                      default="changeme", help="password")
+    parser.add_option("-P", "--port", dest="port", type="int",
+                      default=mincemeat.DEFAULT_PORT, help="port")
+    parser.add_option("-v", "--verbose", dest="verbose", action="store_true")
+    parser.add_option("-V", "--loud", dest="loud", action="store_true")
+
+    (options, args) = parser.parse_args()
+                      
+    if options.verbose:
+        logging.basicConfig(level=logging.INFO)
+    if options.loud:
+        logging.basicConfig(level=logging.DEBUG)
+
+    credentials = {
+        'password':         options.password,
+        'interface':        'localhost',
+        'port':             options.port,
+    
+        # Causes TaskManager to stay idle awaiting Transactions
+        'datasource':       None,
+        'cycle':            mincemeat.TaskManager.PERMANENT,
+
+        'mapfn':            mapfn,
+        'collectfn':        collectfn,
+        'reducefn':         reducefn,
+        'finishfn':         finishfn,
+        'resultfn':         resultfn,
+    }
+
+
     cli = None
     clista = "(none)"
     svr = None
@@ -770,5 +793,4 @@ def main():
     return code
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.WARNING)
     sys.exit(main())
