@@ -16,7 +16,7 @@ testcount = 0
 def unique_port(port):
     return port + 99 + testcount
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.ERROR)
 
 
 data = ["Humpty Dumpty sat on a wall",
@@ -292,6 +292,7 @@ def test_example():
         }.iteritems())
     assert results == expected
 
+
 import itertools
 class repeat_command(object):
     """
@@ -353,7 +354,7 @@ def test_oneshot():
     # First, start up several clients, delayed by a second.  This will
     # result in several Clients starting at roughly the same time; but they
     # won't all be available
-    clients = random.randint(3,10)
+    clients = random.randint(7,15)
     logging.info("Starting %d clients...", clients)
 
     port = unique_port( mincemeat.DEFAULT_PORT )
@@ -373,7 +374,6 @@ def test_oneshot():
                         {1:"st", 2:"nd", 3:"rd"}.get(
                             num % 100 // 10 != 1 and num % 10 or 0, "th"))),
                 "allocation": mincemeat.TaskManager.ONESHOT,
-                "cycle":      mincemeat.TaskManager.PERMANENT,
             }
 
     which = monotonic()
@@ -399,9 +399,10 @@ def test_oneshot():
                     self.name(), command, chan.name() ))
             self.set_datasource( **which.transaction( "backchannel" ))
             return True
-
+    cli = []
     for _ in xrange(clients):
         c = Cli(map={})
+        cli.append(c)
         t = threading.Timer(1.0, c.conn,
                         args=("", port),
                         kwargs={"password": "changeme"})
@@ -436,24 +437,45 @@ def test_oneshot():
     # doesn't improperly interfere with processing ongoing Transactions, when
     # enqueueing another datasource.  We should get at least one of these
     # scheduled and processed before the Server goes idle and quits...
-    sd.endpoint.schedule.append(
-        ( mincemeat.timer(),
+    sd_scheduled = ( mincemeat.timer(),
           lambda: sd.endpoint.set_datasource(
                 **which.transaction( "scheduled" )),
-          0.75 ))
+          0.75 )
+    sd.endpoint.schedule.append( sd_scheduled )
 
     # Run server 'til all datasources are complete, then check Server's .output
     # for multiple results.
     sd.start()
     state = None
-    while not sd.endpoint.finished():
+    chans = 0
+    logging.warning("Test starting...")
+    limit = mincemeat.timer() + 60
+    stopping = False
+    while ( mincemeat.timer() < limit 
+            and (not sd.endpoint.finished() 
+                 or len(sd.endpoint.taskmanager.channels) > 0 )):
+
+        newchans = len(sd.endpoint.taskmanager.channels)
+        if newchans != chans:
+            logging.warning("Server has %2s channels", newchans)
+            chans = newchans
+            
         newstate = sd.endpoint.taskmanager.state
         if newstate != state:
-            print mincemeat.TaskManager.statename[newstate]
+            logging.warning("Server is %s", mincemeat.TaskManager.statename[newstate])
             state = newstate
+
         time.sleep(.1)
-        if which.base >= 50:
+        if which.base >= 50 and not stopping:
+            # Shut down the server.  Wait a bit for all the Clients to shut down
+            # cleanly, just to avoid a "Broken pipe" as they attempt to shut
+            # down their sockets...
+            logging.warning("Test completing...")
             sd.endpoint.taskmanager.defaults["cycle"] = mincemeat.TaskManager.SINGLEUSE
+            limit = mincemeat.timer() + 10
+            stopping = True
+
+    logging.warning("Test done.")
     sd.stop()
 
     expected = {}

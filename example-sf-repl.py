@@ -592,6 +592,17 @@ class Svr(mincemeat.Server_HB_daemon):
                  **kwargs):
         mincemeat.Server_HB_daemon.__init__(self, credentials, cls=cls,
                                             **kwargs)
+    def stop(self):
+        """
+        Our Server is set up to run in PERMANENT mode.  To force it to stop
+        cleanly (ie. report .finished() == True), we need to switch the
+        TaskManager to SINGLEUSE mode on shutdown, and force it to process (and
+        decide to exit.)
+        """
+        self.endpoint.taskmanager.defaults["cycle"] \
+            = mincemeat.TaskManager.SINGLEUSE
+        self.endpoint.taskmanager.jump_start(count=1)
+        return mincemeat.Server_HB_daemon.stop(self)
 
 
 def REPL( cli ):
@@ -739,7 +750,6 @@ def main():
                     svr.stop(cycle)
                     svr = None
 
-
         # We've given the the 'ol college try, to start a Client;
         # ensure we have had a Client!  If so, wait 'til it is done.
         # If we (also) ran a Server_thread, it'll use the 'resultfn'
@@ -753,7 +763,7 @@ def main():
         # transmission) every second.  This means that, upon failure
         # to transmit
 
-        rpt = threading.Thread( target = REPL, args=(cli,) )
+        rpt = threading.Thread( target=REPL, args=(cli,) )
         rpt.start()
 
         while cli.is_alive() and rpt.is_alive():
@@ -761,6 +771,7 @@ def main():
             if svr:
                 svrsta = logchange( svr, svrsta )
             time.sleep( 1 )
+
 
     except KeyboardInterrupt:
         logging.info("%s Manual shutdown requested" % (
