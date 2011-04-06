@@ -556,23 +556,24 @@ def trigger(schedule, now=None):
         now = timer()
     nxt = None
     for exp, fun, rpt in sorted(schedule):
-        try:
-            if now >= exp:
-                # Scheduled event expired; Fire fun()!  Arbitrary time passes...
-                logging.debug("Firing scheduled event %s (repeat: %s)" % (
-                        function_name(fun), rpt))
+        if now >= exp:
+            # Scheduled event expired; Fire fun()!  Arbitrary time passes...
+            logging.debug("Firing scheduled event %s (repeat: %s)" % (
+                    function_name(fun), rpt))
+            try:
                 fun()
-                now = timer()
-            else:
-                # Scheduled event is in future; done.
-                nxt = minimum_time(nxt, exp)
-                break
-        except Exception, e:
-            # A scheduled event failed; this isn't
-            # considered fatal, but may be of interest...
-            logging.warning("Failed scheduled event %s: %s\n%s" % (
-                    fun, e, traceback.format_exc()))
-    
+            except Exception, e:
+                # A scheduled event failed; this isn't
+                # considered fatal, but may be of interest...
+                logging.warning("Failed scheduled event %s: %s\n%s" % (
+                        fun, e, traceback.format_exc()))
+            # Arbitrary time has passed (exception or not)
+            now = timer()
+        else:
+            # Scheduled event is in future; done.
+            nxt = minimum_time(nxt, exp)
+            break
+
         # This event was at or before now (and was fired); remove it and loop to
         # get next one (if any).
         schedule.remove((exp, fun, rpt))
@@ -583,7 +584,8 @@ def trigger(schedule, now=None):
             exp, mis, pas = next_future_time(exp, rpt, now=now)
             nxt = minimum_time(nxt, exp)
             if int(mis):
-                logging.info("Missed %d firings (and %.3f s of next) of scheduled event %s" % (
+                logging.info("Missed %d firings (and %.3f s of next)"
+                             " of scheduled event %s" % (
                         int(mis), pas, function_name(fun)))
             schedule.append((exp, fun, rpt))
 
@@ -1321,7 +1323,7 @@ class Protocol(async_chat):
             # it doesn't flow through...
             self.schedule.append(
                 (timer() + self.shuttout, self.handle_close, None))
-        else:
+        elif not self.closed:
             # Already did a shutdown, no connection timeouts, or no schedule to
             # handle them, or an exception while attempting to shut down socket
             # and schedule a future cleanup.  Just close.
@@ -1772,9 +1774,9 @@ class Server(asyncore.dispatcher, Mincemeat_class):
     Creates instances of ServerChannel on-demand, as incoming connect
     requests complete.
 
-    Note that this must be a "new-style" class (hence the extraneous
-    class dependency on 'object').  This is required to support
-    Properties (see datasource = ..., below)
+    Note that this must be a "new-style" class (forced by inheritance
+    from Mincemeat_class).  This is required to support Properties
+    (see datasource = ..., below)
     """
 
     def __init__(self, map=None, schedule=None, shuttout=None):
@@ -1788,11 +1790,10 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
         The .schedule and .shuttout are (eventually) passed to each newly minted
         ServerChannel, to allow it to perform a tidy_close (if shuttout is None,
-        they will simply close).  We can handle a map==None (the default, global
-        asyncore.dispatcher map will be used); If schedule and shuttout are
-        None, then ServerChannels will be taken down harshly at
-        Server.handle_close, because ServerChannel.handle_close will simply
-        invoke .close!
+        they will simply close).  We can handle a map=None (the default, global
+        asyncore.dispatcher map will be used); If shuttout is None, then
+        ServerChannels will be taken down harshly at Server.handle_close,
+        because ServerChannel.handle_close will simply invoke .close!
 
         For historical consistency, the TaskManager is set up with the default
         cycle, etc., which is TaskManager.SINGLEUSE by default -- shut down
@@ -1819,6 +1820,8 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         else:
             asyncore.dispatcher.__init__(self, map=map)
 
+        if schedule is None:
+            schedule = collections.deque()
         self.schedule = schedule
         self.shuttout = shuttout
 
@@ -2125,7 +2128,7 @@ class Server(asyncore.dispatcher, Mincemeat_class):
         See the example*.py files for samples of various usages.
         """
         self.conn(password=password, port=port, interface=interface,
-                   asynchronous=asynchronous)
+                  asynchronous=asynchronous)
 
         # If we are asynchronous, we have NOT initiated processing;
         # This will return None, if not finished(), or the results if
@@ -2312,17 +2315,26 @@ class ServerChannel(Protocol):
     # 
     # When the TaskManager decides that it is done, ServerChannels reporting for
     # duty will be issued a Protocol 'disconnect' command, which will cause them
-    # to perform a handle_close.
+    # to perform a handle_close.  After that is done (once), we'll detect a
+    # .shutdown or .closed, and do nothing (taskmanager state already changed).
     # 
     # We don't want to try to deduce whether or not this channel should be
     # closing, here -- we leave it up to the higher-level TaskManager, Server,
     # etc., to decide these things.  Otherwise, we'll get into trouble with
     # multiple parties trying to maintaining TaskManager's state (eg. via
     # jump_start.)
+    # 
+    # If we've been shutdown or closed, either before or after during the call
+    # to next_task, we can just do nothing (the channel state will have been
+    # maintained). 
     def start_new_task(self):
+        if self.shutdown or self.closed:
+            return
         command, data, txn = self.server.taskmanager.next_task(self)
         if command == None:
             self.server.taskmanager.channel_idle(self)
+            return
+        if self.shutdown or self.closed:
             return
         self.server.taskmanager.channel_sending(self, command, data, txn)
         self.send_command(command, data, txn)
@@ -2538,7 +2550,8 @@ class TaskManager(object):
         if self.channels.get(chan, None):
             self.channel_log(chan, "Done", how="debug")
         self.channels[chan] = (txn, command, None, time.time())
-        self.channel_log(chan, "Sending", detail=repr.repr(data))
+        self.channel_log(chan, "Sending", 
+                         detail=repr.repr(data) if data is not None else "")
 
     def channel_process(self, chan, response, data, txn):
         """
@@ -2565,7 +2578,8 @@ class TaskManager(object):
         except:
             what = "Spontaneous"
             
-        self.channel_log(chan, what, detail=repr.repr(data))
+        self.channel_log(chan, what,
+                         detail=repr.repr(data) if data is not None else "")
 
     def channel_log(self, chan, what, detail=None, how="info"):
         if chan is None:
@@ -2836,8 +2850,10 @@ class TaskManager(object):
                 self.state = self.IDLE
                 # Fall through and Loop to IDLE state
             else:
-                # SINGLEUSE.  Done.  Kill server, disconnect any
-                # channels coming for tasks
+                # SINGLEUSE.  Done.  Kill server, disconnect any channels coming
+                # for tasks.  The default implementation of Server.handle_close
+                # also closes all the ServerChannels, but send a redundant
+                # 'disconnect', too, in case some derived class changes that...
                 self.server.handle_close()
                 return ('disconnect', None, self.txn)
 
