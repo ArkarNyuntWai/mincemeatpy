@@ -1836,7 +1836,8 @@ class Server(asyncore.dispatcher, Mincemeat_class):
 
     def resultfn(self, txn, results):
         """
-        By default, just collect up the results in the self.output deque.
+        Take responsibilty for some Map/Reduce results.  By default, just
+        collect up the results in the self.output deque.
 
         This may be overridden in a derived class:
 
@@ -1844,8 +1845,8 @@ class Server(asyncore.dispatcher, Mincemeat_class):
                 def resultfn(txn, results):
                     ...
 
-        or (as with the other configurable Server methods like
-        .mapfn), redefined by a assignment:
+        or (as with the other configurable Server methods like .mapfn),
+        redefined by a assignment:
 
             s = mincemeat.Server()
             s.resultfn = my_resultfn
@@ -2655,6 +2656,14 @@ class TaskManager(object):
             if transaction:
                 logging.warning("%s unrecognized TaskManager configuration: %s " % (
                     self.server.name(), repr.repr(transaction)))
+
+            # Tidy up residual state from prior Map/Reduce runs (may be large).
+            self.items = None
+            self.been = None
+            self.done = None
+            self.work = None
+            self.results = None
+
             if channel is not None and self.datasource is not None:
                 # Got a datasource; may be empty (we want to return empty
                 # results), but isn't None; Fire it up.  
